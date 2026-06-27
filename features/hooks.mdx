@@ -1,0 +1,370 @@
+---
+title: "Lifecycle Hooks for Schema-Driven Resources"
+sidebarTitle: "Hooks"
+description: "Run code before or after every create, update, and delete on a single resource by declaring hooks directly on your schema file."
+---
+
+A lifecycle hook is a function you declare on a schema file that runs around the framework's persist step. Use hooks when a side effect or invariant belongs to one resource — validating a field combination before save, generating a derived value, sending a welcome email after create, or refusing a delete while dependents exist. For cross-resource side effects that span every schema, use a [plugin](/plugins/overview) instead.
+
+## Declaring hooks
+
+Add a `hooks` block to your schema's top-level export. Every key is optional — declare only what you need:
+
+```js
+const { ForbiddenError, ValidationError } = require('davepi/utils/errors');
+
+module.exports = {
+  path: 'order',
+  collection: 'order',
+  fields: [
+    { name: 'userId',    type: String, required: true },
+    { name: 'accountId', type: String, required: true },
+    { name: 'code',      type: String, required: true },
+    { name: 'total',     type: Number },
+    { name: 'status',    type: String },
+  ],
+  hooks: {
+    beforeCreate: async ({ input, user, req, schema }) => {
+      if (input.total < 0) throw new ValidationError('total must be non-negative');
+      return { ...input, code: generateCode() };
+    },
+    afterCreate: async ({ record, user, req, schema }) => {
+      await sendOrderConfirmation(record);
+    },
+    beforeUpdate: async ({ input, current, user, req, schema }) => {
+      if (current.status === 'closed') {
+        throw new ForbiddenError('closed orders are read-only');
+      }
+      return input;
+    },
+    afterUpdate: async ({ record, previous, user, req, schema }) => {
+      if (record.total !== previous.total) {
+        await recalculateInvoice(record);
+      }
+    },
+    beforeDelete: async ({ current, user, req, schema }) => {
+      const dependents = await Invoice.countDocuments({ orderId: current._id });
+      if (dependents > 0) throw new ForbiddenError('order has invoices');
+    },
+    afterDelete: async ({ record, user, req, schema }) => {
+      await notifyAccounting(record);
+    },
+  },
+};
+```
+
+## The six hook slots
+
+<Tabs>
+  <Tab title="beforeCreate">
+    Fires just before the insert. Server-stamped `userId` / `accountId` and any state-machine initial state are already present on `input`.
+
+    **Signature:** `async ({ input, user, req?, schema }) => input | undefined`
+
+    - Return a new object to replace the input that gets persisted.
+    - Return `undefined` (or nothing) to keep the input unchanged.
+    - Throw to reject the operation.
+
+    ```js
+    beforeCreate: async ({ input, user }) => {
+      return { ...input, code: `ORD-${Date.now()}`, createdBy: user.user_id };
+    }
+    ```
+  </Tab>
+  <Tab title="afterCreate">
+    Fires after insert, after the response is built, before it is sent.
+
+    **Signature:** `async ({ record, user, req?, schema }) => void`
+
+    - Best-effort: throws are logged with `pino.warn` and swallowed — the response has already committed.
+    - `record` is the persisted document, ACL-projected through the actor's roles.
+
+    ```js
+    afterCreate: async ({ record, req }) => {
+      await postmark.sendEmail({
+        to: record.email,
+        subject: 'Welcome!',
+        body: `Hi ${record.firstName}, glad you're here.`,
+      });
+    }
+    ```
+  </Tab>
+  <Tab title="beforeUpdate">
+    Fires just before the `$set`. The input has already been filtered through field-level ACL writability.
+
+    **Signature:** `async ({ input, current, user, req?, schema }) => input | undefined`
+
+    - `current` is the lean Mongo document as it exists right now.
+    - Return a new object to replace the input; return nothing to keep it.
+    - Throw to reject.
+
+    ```js
+    beforeUpdate: async ({ input, current }) => {
+      if (current.status === 'closed' && input.total !== current.total) {
+        throw new ForbiddenError('cannot change total on a closed order');
+      }
+      return input;
+    }
+    ```
+  </Tab>
+  <Tab title="afterUpdate">
+    Fires after persistence, with both the old and new record.
+
+    **Signature:** `async ({ record, previous, user, req?, schema }) => void`
+
+    - Best-effort: throws are logged and swallowed.
+    - `record` is the new state; `previous` is what it was before.
+
+    ```js
+    afterUpdate: async ({ record, previous }) => {
+      if (record.stage !== previous.stage) {
+        await crm.syncDealStage(record._id, record.stage);
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="beforeDelete">
+    Fires after the record is fetched, before the delete or soft-delete tombstone.
+
+    **Signature:** `async ({ current, user, req?, schema }) => void`
+
+    - Throw to prevent the delete.
+    - There is no return value — `current` cannot be mutated here.
+
+    ```js
+    beforeDelete: async ({ current }) => {
+      const open = await Invoice.countDocuments({ orderId: current._id, status: 'open' });
+      if (open > 0) throw new ForbiddenError('order has open invoices');
+    }
+    ```
+  </Tab>
+  <Tab title="afterDelete">
+    Fires after the delete (or soft-delete tombstone), before the response.
+
+    **Signature:** `async ({ record, user, req?, schema }) => void`
+
+    - Best-effort: throws are logged and swallowed.
+    - `record` is the deleted document.
+
+    ```js
+    afterDelete: async ({ record }) => {
+      await searchIndex.remove(record._id);
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Context fields reference
+
+<ParamField body="input" type="object">
+  The about-to-be-persisted payload (`beforeCreate` / `beforeUpdate` only). Already ACL-filtered and tenant-stamped. Returning a new object **replaces** it; returning `undefined` keeps it as-is.
+</ParamField>
+
+<ParamField body="current" type="object">
+  The lean Mongo document as it exists right now (`beforeUpdate` / `beforeDelete`).
+</ParamField>
+
+<ParamField body="record" type="object">
+  The persisted document, ACL-projected through the actor's roles (`afterCreate` / `afterUpdate` / `afterDelete`).
+</ParamField>
+
+<ParamField body="previous" type="object">
+  The document as it was before the update (`afterUpdate` only).
+</ParamField>
+
+<ParamField body="user" type="object">
+  The authenticated user from the JWT — `{ user_id, email, roles, ... }`.
+</ParamField>
+
+<ParamField body="req" type="object">
+  The Express request when REST is the caller. `undefined` under GraphQL. Use it for `req.log`, `req.headers`, `req.ip`, etc.
+</ParamField>
+
+<ParamField body="schema" type="object">
+  The full schema definition, useful for hooks shared across resources via a helper.
+</ParamField>
+
+## Returning vs. mutating input
+
+Both patterns work in `before*` hooks, but returning a new object is the safer approach:
+
+<CodeGroup>
+```js Recommended (return new object)
+beforeCreate: async ({ input }) => {
+  return { ...input, code: generateCode() };
+}
+```
+
+```js Also works (in-place mutation)
+beforeCreate: async ({ input }) => {
+  input.code = generateCode();
+  // no return: framework keeps the mutated input
+}
+```
+</CodeGroup>
+
+<Warning>
+  Returning `null` from a `before*` hook is **not** a special signal — it replaces the input with `null` and crashes the insert. Return an object or return nothing.
+</Warning>
+
+## Rejecting an operation
+
+Throw a typed error from `davepi/utils/errors`:
+
+```js
+const { ValidationError, ForbiddenError, ConflictError, NotFoundError } = require('davepi/utils/errors');
+
+beforeUpdate: async ({ input, current }) => {
+  if (current.status === 'closed' && input.total !== current.total) {
+    throw new ForbiddenError('cannot change total on a closed order');
+  }
+}
+```
+
+This produces the standard error shape:
+
+```json
+{
+  "error": {
+    "code": "FORBIDDEN",
+    "message": "cannot change total on a closed order"
+  }
+}
+```
+
+| Error class | HTTP status | Use when |
+|-------------|-------------|----------|
+| `ValidationError` | 400 | The client supplied something invalid. |
+| `ConflictError` | 409 | A uniqueness collision (the framework also maps Mongo `11000` here). |
+| `ForbiddenError` | 403 | The caller cannot perform this action. |
+| `NotFoundError` | 404 | A referenced resource is missing. |
+
+<Note>
+  `after*` hooks **never** reject the response. A throw inside an `after*` hook is logged and swallowed — the mutation has already committed. Design `after*` hooks to be safely retryable. For work that absolutely must succeed, use a plugin and subscribe to the event bus.
+</Note>
+
+## Surface coverage
+
+Hooks fire on single-record paths only:
+
+| Surface | Fires hooks? | Notes |
+|---------|-------------|-------|
+| `POST /api/v1/<path>` | ✅ | `beforeCreate` then `afterCreate`. |
+| `PUT /api/v1/<path>/:id` | ✅ | `beforeUpdate` then `afterUpdate`. State-machine validation runs **after** `beforeUpdate`. |
+| `DELETE /api/v1/<path>/:id` | ✅ | `beforeDelete` then `afterDelete`. Fires for both soft-delete and hard-delete. |
+| GraphQL `<path>CreateOne` | ✅ | Same shape as REST `POST`. |
+| GraphQL `<path>UpdateById` | ✅ | Same shape as REST `PUT` by id. |
+| GraphQL `<path>RemoveById` | ✅ | Same shape as REST `DELETE`. |
+| Bulk `PUT /api/v1/<path>` | ❌ | Operates on a server-side filter; per-record hooks would multiply work unexpectedly. |
+| GraphQL `<path>CreateMany` | ❌ | Bulk path. |
+| GraphQL `<path>UpdateMany` / `<path>UpdateOne` | ❌ | Operate on a filter, not a known `_id`. |
+| GraphQL `<path>RemoveMany` | ❌ | Bulk path. |
+| GraphQL `<path>Transition<Field>` | ⚠️ Partial | Runs `onEnter` but does **not** run `beforeUpdate` / `afterUpdate`. Use `onEnter` for transition-specific side effects. |
+
+To react to bulk writes, subscribe to the [record event bus](/plugins/overview#event-bus) from a plugin.
+
+## Calling a plugin from a hook
+
+Plugins are plain CommonJS modules, so `require` them like any other helper. By convention, use the `#plugins/` import alias:
+
+```js
+// plugins/postmark.js
+const { ServerClient } = require('postmark');
+let client = null;
+
+async function sendEmail({ to, subject, body }) {
+  if (!client) throw new Error('postmark plugin not initialised');
+  return client.sendEmail({ From: 'noreply@example.com', To: to, Subject: subject, TextBody: body });
+}
+
+module.exports = {
+  name: 'postmark',
+  async setup({ log }) {
+    client = new ServerClient(process.env.POSTMARK_TOKEN);
+    log.info({}, 'postmark client ready');
+  },
+  sendEmail,
+};
+```
+
+```js
+// schema/versions/v1/user.js
+const postmark = require('#plugins/postmark');
+
+module.exports = {
+  path: 'user',
+  fields: [/* ... */],
+  hooks: {
+    afterCreate: async ({ record, req }) => {
+      try {
+        await postmark.sendEmail({
+          to: record.email,
+          subject: 'Welcome!',
+          body: `Hi ${record.firstName}, glad you're here.`,
+        });
+      } catch (err) {
+        (req?.log || console).error({ err }, 'welcome email failed');
+      }
+    },
+  },
+};
+```
+
+Load ordering makes this safe: schema files are required at boot (so the `require` resolves immediately), plugin `setup` runs after the schema pass (initialising the client), and hooks only fire during request handling.
+
+## Sharing hooks across schemas
+
+Put a helper under `./lib/` and require it via the `#lib/` alias:
+
+```js
+// lib/audit-author.js
+exports.recordAuthor = async ({ input, user }) => ({
+  ...input,
+  createdBy: user.user_id,
+});
+```
+
+```js
+// schema/versions/v1/note.js
+const { recordAuthor } = require('#lib/audit-author');
+
+module.exports = {
+  path: 'note',
+  fields: [/* ... */],
+  hooks: { beforeCreate: recordAuthor },
+};
+```
+
+## Deferred side effects
+
+`after*` hooks are awaited inline and block the response. If a side effect is slow and can be deferred, fire-and-forget from the hook body:
+
+```js
+afterCreate: async ({ record, req }) => {
+  // Don't await — let the response go out immediately.
+  sendWelcomeEmail(record).catch((err) =>
+    (req?.log || console).error({ err }, 'welcome email failed')
+  );
+}
+```
+
+## What hooks do not see
+
+<Accordion title="Relation data from __include">
+  `record` in `after*` hooks is the persisted document — not the response with `__include` populated. Re-fetch relations yourself if you need them.
+</Accordion>
+
+<Accordion title="ACL-restricted fields">
+  `afterCreate` / `afterUpdate` / `afterDelete` receive the record with the **actor's** read-ACL applied. A hook running on behalf of a non-admin user won't see `salary` if `salary` is admin-only on read.
+</Accordion>
+
+<Accordion title="Soft-delete restores">
+  `POST /:id/restore` does not fire `afterUpdate`. It writes an audit row and emits a `<path>.updated` event — subscribe via a plugin if you need to react.
+</Accordion>
+
+## See also
+
+- [Plugins](/plugins/overview) — cross-cutting extensions and event-bus subscribers.
+- [State machines](/features/state-machines) — `onEnter[<state>]` for transition-specific side effects.
+- [Errors](/reference/errors) — typed error classes to throw from `before*` hooks.
+- [Webhooks](/features/webhooks) — outbound HTTP fan-out, often what an `afterCreate` would otherwise do manually.

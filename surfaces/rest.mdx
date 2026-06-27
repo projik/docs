@@ -1,0 +1,217 @@
+---
+title: "Auto-Generated REST API Reference for dAvePi"
+sidebarTitle: "REST API"
+description: "Every schema you define gets the same set of REST routes — CRUD, pagination, filtering, relations, file uploads, and more — wired automatically."
+---
+
+dAvePi mounts a complete Express router for every schema you load. Once you know the route shape for one resource, you know it for all of them: the same methods, the same query params, and the same response envelope apply everywhere. The server runs at `/api/v1/<path>` where `<path>` matches the `path` field you set in the schema file.
+
+## Routes per resource
+
+Every loaded schema gets the following routes automatically. Replace `<path>` with your schema's `path` value (e.g., `account`, `contact`).
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/v1/<path>` | Create a record. `userId` and `accountId` are stamped from the JWT — never pass them in the body. Accepts an optional `Idempotency-Key` header. |
+| `GET` | `/api/v1/<path>` | List records. Supports pagination, sorting, filtering, `__include`, full-text search, and `__includeDeleted`. |
+| `PUT` | `/api/v1/<path>` | Bulk upsert. Applies a filter and a record body; ownership is pinned to the JWT. |
+| `GET` | `/api/v1/<path>/:id` | Read one record. Accepts the same `__include` set as the list route. |
+| `PUT` | `/api/v1/<path>/:id` | Partial update. State-machine fields are validated against the allowed transitions for the current state. |
+| `DELETE` | `/api/v1/<path>/:id` | Soft-delete (or hard-delete on schemas with `softDelete: false`). |
+| `POST` | `/api/v1/<path>/:id/restore` | Clear the `deletedAt` tombstone. Available only on soft-delete schemas. |
+| `GET` | `/api/v1/<path>/:id/history` | Return the audit log for a record, newest first. Available only on audit-enabled schemas. |
+| `GET` | `/api/v1/<path>/aggregations/<name>` | Run a named aggregation declared on the schema. |
+| `POST` | `/api/v1/<path>/:id/<file-field>` | Upload a file (multipart). |
+| `GET` | `/api/v1/<path>/:id/<file-field>` | Fetch file metadata and a URL. |
+| `DELETE` | `/api/v1/<path>/:id/<file-field>` | Delete the blob and clear the metadata field. |
+| `GET` | `/api/v1/<path>-schema` | Introspection JSON for this schema. |
+
+---
+
+## Auth
+
+Send a Bearer JWT on every authenticated request. The framework reads `user_id` and `roles` from the verified token automatically — never include them in the request body.
+
+```http
+Authorization: Bearer <token>
+```
+
+Get a token by calling `POST /login`. See the [Quickstart](/quickstart/) for the full registration and login flow.
+
+### Public read with X-Client-Id
+
+For unauthenticated frontends (storefronts, marketing sites), you can issue a public client ID and send it as a header instead of a Bearer token. The server resolves the ID to a role and applies the mandatory scope filter declared in the schema's `acl.scope` map.
+
+```http
+GET /api/v1/product
+X-Client-Id: pk_storefront_live_abc123
+```
+
+Writes from a client-ID caller are always refused with `403`. When both `Authorization` and `X-Client-Id` are present, the Bearer token wins.
+
+---
+
+## Pagination
+
+Three query params control pagination on every list endpoint:
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `__page` | `1` | 1-indexed page number. |
+| `__sort` | `createdAt:desc` (or `score` when `q` is set) | `field:asc`, `field:desc`, or `score`. Comma-separate multiple fields. |
+| `__perPage` | `PAGE_SIZE` env var (default 20) | Capped at 200. |
+
+Every list response follows the same envelope:
+
+```json
+{
+  "results": [ /* array of documents */ ],
+  "totalResults": 142,
+  "page": 1,
+  "perPage": 20,
+  "totalPages": 8,
+  "nextPage": 2,
+  "prevPage": null
+}
+```
+
+---
+
+## Filtering
+
+Filters use [mongo-querystring](https://github.com/fox1t/mongo-querystring) conventions on the URL. Pass object values as JSON-encoded strings.
+
+```http
+GET /api/v1/contact?accountId=abc
+GET /api/v1/contact?createdAt={"$gte":"2026-01-01"}
+GET /api/v1/contact?name={"$regex":"^Ja","$options":"i"}
+```
+
+| Operator | Form |
+|----------|------|
+| Equality | `field=value` |
+| Comparison | `field={"$gt": ...}` (also `$gte`, `$lt`, `$lte`, `$ne`) |
+| In list | `field={"$in": ["a","b"]}` |
+| Regex | `field={"$regex": "...", "$options": "i"}` |
+
+<Note>
+Sub-objects must be JSON-encoded and URL-safe. The [TypeScript client](/surfaces/client/) handles this encoding for you automatically.
+</Note>
+
+---
+
+## Loading relations with `__include`
+
+Pass a comma-separated list of relation names to populate nested documents in a single query:
+
+```http
+GET /api/v1/account/abc?__include=contacts,primaryContact
+```
+
+Relation names come from the `relations` map in your schema file. See [Relations](/features/relations/) for the full configuration reference.
+
+---
+
+## Full-text search with `q`
+
+```http
+GET /api/v1/contact?q=jane
+```
+
+The `q` param is available on any schema that declares at least one field with `searchable: true`. When `q` is set, the default sort switches to `score` (relevance). You can combine `q` with `__page`, `__perPage`, and filter params. See [Search](/features/search/).
+
+---
+
+## Including soft-deleted records
+
+```http
+GET /api/v1/account?__includeDeleted=true
+```
+
+By default, list and get routes exclude tombstoned records (`deletedAt != null`). Pass `__includeDeleted=true` to include them. Relations always filter tombstones regardless of this flag. See [Soft delete](/features/soft-delete/).
+
+---
+
+## Idempotency
+
+Attach an `Idempotency-Key` header to any `POST` to make retries safe. Reusing the same key with the same body returns the original record without creating a duplicate:
+
+```http
+POST /api/v1/account
+Idempotency-Key: 9f3c-4a1b-...
+Content-Type: application/json
+
+{ "accountName": "Acme Inc" }
+```
+
+The response includes an `Idempotency-Replay: true` header when the original result is returned. See [Idempotency keys](/features/idempotency/).
+
+---
+
+## Error shape
+
+Every typed error returns a consistent JSON envelope:
+
+```json
+{
+  "error": {
+    "code": "INVALID_TRANSITION",
+    "message": "Cannot transition status from 'review' to 'archived'",
+    "details": {
+      "current": "review",
+      "attempted": "archived",
+      "allowed": ["approved", "rejected"]
+    }
+  }
+}
+```
+
+Error codes are stable contracts — you can branch on `code` without parsing the `message` string. See [Errors](/reference/errors/) for the full list.
+
+---
+
+## Rate limits
+
+Two rate limiters are active by default:
+
+| Path | Default | Override env var |
+|------|---------|-----------------|
+| `/api/*` | 600 req/min per IP | `RATE_LIMIT_API_PER_MIN` |
+| `/login`, `/register` | 10 req/min per IP | `RATE_LIMIT_AUTH_PER_MIN` |
+
+Rate-limited responses return `429` with `{ "error": { "code": "RATE_LIMITED" } }`. Both limiters are skipped in `NODE_ENV=test`.
+
+---
+
+## CORS
+
+Set `CORS_ORIGINS` to a comma-separated list of allowed origins. Without a value, no cross-origin requests are accepted:
+
+```env
+CORS_ORIGINS=http://localhost:3000,https://app.example.com
+```
+
+---
+
+## Swagger UI
+
+Browse the live interactive docs at `/api-docs`. Download the OpenAPI JSON spec from `/api-docs/swagger.json`. For agent-friendly introspection that includes relations and state machines, use [`GET /_describe`](/surfaces/describe/) instead.
+
+---
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="GraphQL API" icon="circle-nodes" href="/surfaces/graphql">
+    The same surface, GraphQL shape.
+  </Card>
+  <Card title="MCP Server" icon="robot" href="/surfaces/mcp">
+    The same surface, native tool calls for AI agents.
+  </Card>
+  <Card title="TypeScript Client" icon="code" href="/surfaces/client">
+    A typed wrapper over these REST routes.
+  </Card>
+  <Card title="_describe Manifest" icon="magnifying-glass" href="/surfaces/describe">
+    Agent-friendly capability discovery in one request.
+  </Card>
+</CardGroup>

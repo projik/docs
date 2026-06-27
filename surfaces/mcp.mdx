@@ -1,0 +1,262 @@
+---
+title: "MCP Server for AI Agents — dAvePi Native Tool Calls"
+sidebarTitle: "MCP Server"
+description: "dAvePi exposes its full schema-driven surface as an MCP server so AI agents can call your API as native tools with no glue code required."
+---
+
+dAvePi exposes its full schema-driven surface as a [Model Context Protocol](https://modelcontextprotocol.io/) server, so AI agents — Claude Code, Claude Desktop, Cursor, and others — can call into your API as native tools with no hand-written integration. The MCP server is generated from the same schema registry that powers REST and GraphQL. Add a schema and `list_<resource>`, `get_<resource>`, `create_<resource>`, `update_<resource>`, `delete_<resource>`, plus per-aggregation and per-file tools, appear automatically.
+
+## Two transports
+
+| Transport | When to use | Endpoint |
+|-----------|-------------|----------|
+| **Streamable HTTP** | The agent or IDE talks to a running dAvePi server. Stateless — no sticky sessions needed. | `POST /mcp` |
+| **stdio** | Claude Desktop or Claude Code spawn the server as a child process. | `davepi mcp` |
+
+Both transports share the same tool implementations from `utils/mcpServer.js`. Tenant isolation, ACL projection, and soft-delete filtering all match the REST surface exactly.
+
+---
+
+## Auth
+
+Both transports authenticate with a JWT issued by `POST /login`.
+
+- **HTTP transport**: send `Authorization: Bearer <token>` on every `POST /mcp` request.
+- **stdio transport**: set the `DAVEPI_TOKEN` environment variable when launching the process.
+
+The CLI verifies the token at startup using `TOKEN_KEY` and refuses to start with an invalid or missing token. The token's `user_id` claim becomes the tenant identity for every tool call.
+
+### Mint a long-lived stdio token
+
+```bash
+node -e '
+  const jwt = require("jsonwebtoken");
+  console.log(jwt.sign(
+    { user_id: "<your-user-id>", roles: ["user"] },
+    process.env.TOKEN_KEY,
+    { expiresIn: "30d" }
+  ));
+'
+```
+
+Treat this token like any other API credential — it grants the full tool surface as that user.
+
+---
+
+## Tools generated per schema
+
+For each schema, dAvePi generates the following tools. Replace `<path>` with your schema's `path` value.
+
+| Tool | Available when | Description |
+|------|---------------|-------------|
+| `list_<path>` | Always | Paginated list with optional `filter` (mongo-style), `sort`, `q` (full-text), `include` (relations), and `includeDeleted`. |
+| `get_<path>` | Always | Fetch one record by `_id`. Accepts the same `include` set as the list tool. |
+| `create_<path>` | Always | Create a record. `userId` and `accountId` are stamped from the JWT — never accepted from the caller. Accepts `idempotencyKey` for safe retries. |
+| `update_<path>` | Always | Partial update by `_id`. Field-level ACL filters non-writable fields; ownership fields are stripped from the wire automatically. |
+| `delete_<path>` | Always | Soft-delete (or hard-delete on schemas with `softDelete: false`). |
+| `restore_<path>` | `softDelete` enabled (default) | Clear the `deletedAt` tombstone so the record becomes readable again. |
+| `history_<path>` | `audit` enabled (default) | Audit log for a record — `create`, `update`, `delete`, `restore` actions, newest first. Field-level read ACL applied to before/after/diff. |
+| `search_<path>` | Any field has `searchable: true` | Full-text search across the framework text index. Equivalent to `list_<path>` with `sort=score:desc`. |
+| `list_<path>_<rel>` | Per `hasMany` relation | Children for a parent `_id` in a single batched query. |
+| `get_<path>_<rel>` | Per `hasOne` / `belongsTo` relation | Populated relation (or `null`) for a parent `_id`. |
+| `upload_<path>_<field>` | Per `type: 'File'` field | Upload a base64-encoded blob. Validates against the field's `maxBytes` and `accept`. |
+| `fetch_<path>_<field>` | Per `type: 'File'` field | Returns the public or short-lived signed URL plus file metadata. |
+| `delete_<path>_<field>` | Per `type: 'File'` field | Removes the blob and clears the metadata sub-document. |
+| `aggregate_<path>_<name>` | Per declared aggregation | Params surface with their declared types. `$match: { userId }` is prepended automatically. |
+
+State-machine transitions use `update_<path>` with `{ id, record: { <field>: <to> } }`. The framework validates the transition and rejects undeclared moves with `INVALID_TRANSITION`.
+
+### Tool error shape
+
+Every tool result is JSON. On a typed failure the tool returns `isError: true` with a structured payload:
+
+```json
+{
+  "isError": true,
+  "content": [{
+    "type": "text",
+    "text": "{ \"error\": { \"code\": \"VALIDATION\", \"message\": \"...\", \"recoverable\": true } }"
+  }]
+}
+```
+
+The payload includes:
+- `code` — `VALIDATION`, `NOT_FOUND`, `UNAUTHORIZED`, `FORBIDDEN`, `DUPLICATE`, `INVALID_ID`, `INVALID_TRANSITION`, and others.
+- `message` — human-readable description.
+- `recoverable: true` on `VALIDATION` and `INVALID_ID` — the agent can fix its arguments and retry immediately.
+- `auth: true` on `UNAUTHORIZED` — the client can dispatch credential refresh without parsing free-text codes.
+
+---
+
+## Wire up an agent in one line
+
+The `@davepi/mcp` package collapses agent wiring to a single `npx` command. It selects the right transport automatically:
+
+- `DAVEPI_URL` set → HTTP-proxy mode, forwards to the remote `/mcp` endpoint.
+- `DAVEPI_URL` unset → local-stdio mode, spawns `davepi mcp` from the project's local install.
+
+### Claude Code (`.mcp.json` at project root)
+
+```json
+{
+  "mcpServers": {
+    "davepi": {
+      "command": "npx",
+      "args": ["-y", "@davepi/mcp"],
+      "env": {
+        "DAVEPI_URL": "http://localhost:5050",
+        "DAVEPI_TOKEN": "<long-lived-jwt>"
+      }
+    }
+  }
+}
+```
+
+### Claude Desktop (`claude_desktop_config.json`)
+
+macOS path: `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "davepi": {
+      "command": "npx",
+      "args": ["-y", "@davepi/mcp"],
+      "env": {
+        "DAVEPI_URL": "https://api.example.com",
+        "DAVEPI_TOKEN": "<long-lived-jwt>"
+      }
+    }
+  }
+}
+```
+
+### Cursor
+
+Use the same config shape under `.cursor/mcp.json` or in Cursor's MCP settings.
+
+<Tip>
+The `npx create-davepi-app` scaffolder drops a working `.mcp.json` pre-wired with `@davepi/mcp` in every generated project. Scaffold a template and open it in Claude Code for the fastest path to a working setup.
+</Tip>
+
+---
+
+## Embedding the MCP server in your own chatbot
+
+The desktop and IDE wiring above is the right answer when a human is driving Claude Code or Claude Desktop. For a hosted AI chatbot — a web app, Slack bot, or customer-facing assistant — connect to `/mcp` server-to-server instead.
+
+<Warning>
+Never share a single JWT across chat sessions. Each chat session should have its own short-lived token minted for the logged-in user. If two users share a token, they share a tenant and can see each other's rows.
+</Warning>
+
+<Tabs>
+  <Tab title="Path 1 — Anthropic native connector (recommended)">
+    The Messages API accepts an `mcp_servers` array. Hand Anthropic the `/mcp` URL and the session's JWT; Claude executes tools server-side. Your backend stays "send message, get reply."
+
+    ```js
+    import Anthropic from "@anthropic-ai/sdk";
+    const anthropic = new Anthropic();
+
+    async function chat(userMessage, session) {
+      return anthropic.messages.create({
+        model: "claude-opus-4-7",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: userMessage }],
+        mcp_servers: [{
+          type: "url",
+          url:  "https://api.example.com/mcp",
+          name: "davepi",
+          authorization_token: session.davepiJwt, // per-user, short-lived
+        }],
+      });
+    }
+    ```
+
+    Use this path when your model provider supports it — it's the least code and you inherit their tool-call telemetry for free.
+  </Tab>
+  <Tab title="Path 2 — MCP client in your backend">
+    Use the `@modelcontextprotocol/sdk` Streamable HTTP client to list tools once per session and forward calls to your LLM. Choose this path when you need to log, filter, or rate-limit individual tool calls, or when your model API doesn't speak MCP natively.
+
+    ```js
+    import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+    import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+
+    async function buildToolBridge(session) {
+      const transport = new StreamableHTTPClientTransport(
+        new URL("https://api.example.com/mcp"),
+        { requestInit: { headers: { Authorization: `Bearer ${session.davepiJwt}` } } },
+      );
+      const client = new Client({ name: "my-chatbot", version: "1.0.0" });
+      await client.connect(transport);
+
+      const { tools } = await client.listTools();
+      const call = (name, args) => client.callTool({ name, arguments: args });
+
+      return { tools, call };
+    }
+    ```
+
+    The MCP server emits `notifications/tools/list_changed` when the schema hot-reloads, so you can refresh the advertised tool list mid-session.
+  </Tab>
+  <Tab title="Path 3 — Call REST directly">
+    You already have the user's JWT — advertise the REST endpoints as plain function-call tools to any LLM and bypass the MCP protocol. This is the simplest path if you already have a tool-calling loop wired up. You give up:
+
+    - Automatic tool-list refresh on schema change.
+    - The typed `{ code, message, recoverable, auth }` error envelope in tool results.
+    - Per-tool descriptions derived from your schema's JSON Schemas.
+
+    For anything beyond a handful of endpoints, Path 1 or Path 2 pays for itself quickly.
+  </Tab>
+</Tabs>
+
+---
+
+## Hot reload
+
+Both transports respond to schema changes live:
+
+- **HTTP**: each `POST /mcp` builds a fresh server from the current registry.
+- **stdio**: subscribes to `schemaLoader.onChange` and rebuilds the tool list on the existing connection. The SDK emits `notifications/tools/list_changed` so the connected client refreshes its registry without reconnecting.
+
+---
+
+## Example: asking Claude Code to add a field
+
+Open a project scaffolded from the CRM template in Claude Code with `.mcp.json` in place. Then prompt:
+
+> "Add a `region` field (string, required) to the Account schema and update any existing accounts to set region to 'North America'."
+
+Claude Code will:
+1. Read the current schema via `/_describe` or the schema file.
+2. Edit `schema/versions/v1/account.js` to add the field.
+3. Wait for the hot-reload notification that new `account` tools are available.
+4. Call `list_account` to find existing records, then `update_account` in a loop to back-fill `region`.
+
+The agent never needs to learn your API surface manually — the MCP tools update as soon as your schema does.
+
+---
+
+## Deployment notes
+
+- `/mcp` is **stateless** — every `POST` builds a fresh server from the current registry — so it scales horizontally behind a load balancer without sticky sessions.
+- The `apiLimiter` middleware runs on `/api/*` only, not `/mcp`. Add your own per-tenant rate limiting in front of `/mcp` for chatbots that may issue bursty tool sequences.
+- `CORS_ORIGINS` does not apply to server-to-server calls from your chatbot backend; it only matters if a browser hits `/mcp` directly.
+
+---
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Why Agents Come First" icon="robot" href="/concepts/agent-first">
+    The design rationale behind the MCP surface.
+  </Card>
+  <Card title="_describe Manifest" icon="magnifying-glass" href="/surfaces/describe">
+    What an agent reads on first contact with a project.
+  </Card>
+  <Card title="REST API" icon="server" href="/surfaces/rest">
+    The same surface over HTTP routes.
+  </Card>
+  <Card title="Idempotency Keys" icon="key" href="/features/idempotency">
+    The `idempotencyKey` argument on every `create_<path>` tool.
+  </Card>
+</CardGroup>

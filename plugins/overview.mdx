@@ -1,0 +1,279 @@
+---
+title: "Plugin System Overview — dAvePi Extensions"
+sidebarTitle: "Overview"
+description: "Extend dAvePi with cross-cutting plugins: register routes, react to record events, integrate third-party services, and schedule background work."
+---
+
+Plugins are the right tool whenever work cuts across multiple resources — audit exports, third-party integrations, scheduled jobs, or custom routes that span schemas. For side effects that belong to a single resource (send a welcome email on user create, validate before save), use a [lifecycle hook](/features/hooks/) on the schema file instead. Plugins load after every schema is registered and run in declaration order; each plugin's `setup` is awaited before the next one starts, so a plugin that establishes shared state for later plugins is well-defined.
+
+## Register a plugin
+
+List plugin specifiers under `davepi.plugins` in your project's `package.json`. The entry can be a relative path, an absolute path, or an installed npm package name:
+
+```json
+{
+  "name": "my-app",
+  "dependencies": {
+    "davepi": "^1.0.4",
+    "davepi-plugin-slack": "^1.0.0"
+  },
+  "davepi": {
+    "plugins": [
+      "./plugins/my-custom-plugin.js",
+      "davepi-plugin-slack"
+    ]
+  }
+}
+```
+
+| Specifier form | Resolution |
+|----------------|------------|
+| `./plugins/my-plugin.js` | Path relative to `process.cwd()` (your project root). |
+| `/absolute/path/plugin.js` | Absolute path, loaded as-is. |
+| `davepi-plugin-slack` | Node module resolution from your project root. |
+
+Once a plugin is installed, require it from hooks and other plugins using the `#plugins/` subpath alias:
+
+```js
+const slack = require('#plugins/my-slack');
+```
+
+## Plugin module shape
+
+Every plugin module exports an object with `name` and `setup`. Both fields are required — the loader throws at boot if either is missing.
+
+```js
+// plugins/my-plugin.js
+module.exports = {
+  name: 'my-plugin',
+  async setup({ app, schemaLoader, bus, log, appName }) {
+    log.info({ appName }, 'my-plugin starting');
+
+    // 1. Mount a custom route.
+    app.get('/api/v1/_status', (req, res) => {
+      res.json({ schemas: schemaLoader.listSchemas() });
+    });
+
+    // 2. Subscribe to record events.
+    bus.on('record', async (event) => {
+      try {
+        if (event.type === 'order.created') await notifyTeam(event);
+      } catch (err) {
+        log.error({ err, event }, 'notification failed');
+      }
+    });
+
+    // 3. Iterate every registered schema.
+    for (const key of schemaLoader.listSchemas()) {
+      const { schema } = schemaLoader.getEntry(key);
+      app.get(`/api/v1/${schema.path}/_export`, async (req, res) => {
+        // ...per-resource export logic...
+      });
+    }
+  },
+};
+```
+
+### Setup API
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `app` | Express app | The same instance schemas mount onto. Use `app.use(...)`, `app.get(...)`, etc. |
+| `schemaLoader` | object | Live registry. Call `listSchemas()`, `getEntry(key)`, `onChange(fn)`, `runAggregation(...)`. |
+| `bus` | `EventEmitter` | In-process bus that fires `record` events for every CRUD mutation. |
+| `log` | pino logger | Child logger keyed to the plugin's `name`. |
+| `appName` | string | `APP_NAME` env var (defaults to `"dAvePi"`). |
+
+## Event bus
+
+The same event bus the [webhook dispatcher](/features/webhooks/) subscribes to — plugins and outbound webhooks see identical events. Always wrap async handlers in `try/catch`; a throwing handler does not fail the originating request, but it will surface as an `unhandledRejection` if you don't catch it.
+
+<CodeGroup>
+```js Single-record event
+{
+  type:     'order.created', // or .updated / .deleted / .transitioned
+  version:  'v1',
+  userId:   '<tenant>',
+  recordId: '<doc-id>',
+  record:   { /* ACL-projected record */ },
+}
+```
+
+```js Bulk event
+{
+  type:        'order.updated', // or .deleted
+  version:     'v1',
+  userId:      '<tenant>',
+  filter:      { /* the query that matched */ },
+  numAffected: 47,
+}
+```
+
+```js State-machine transition
+{
+  type:     'order.transitioned',
+  version:  'v1',
+  userId:   '<tenant>',
+  recordId: '<doc-id>',
+  field:    'status',
+  from:     'draft',
+  to:       'approved',
+}
+```
+</CodeGroup>
+
+<Warning>
+Always wrap async bus handlers in `try/catch`. The bus calls handlers after the HTTP response is sent — a thrown error cannot be surfaced to the client and will become an `unhandledRejection`.
+</Warning>
+
+## Write a custom plugin
+
+The shortest working plugin subscribes to one event and posts to an internal endpoint:
+
+```js
+// plugins/high-value-alert.js
+const fetch = require('node-fetch');
+
+module.exports = {
+  name: 'high-value-alert',
+  async setup({ bus, log }) {
+    bus.on('record', async (event) => {
+      try {
+        if (event.type !== 'order.created') return;
+        if (!event.record || event.record.total < 1000) return;
+        await fetch(process.env.ALERT_WEBHOOK_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: `High-value order: $${event.record.total}` }),
+        });
+      } catch (err) {
+        log.error({ err, recordId: event.recordId }, 'alert post failed');
+      }
+    });
+  },
+};
+```
+
+Register it in `package.json`:
+
+```json
+{
+  "davepi": {
+    "plugins": ["./plugins/high-value-alert.js"]
+  }
+}
+```
+
+### Expose helpers for hooks to call
+
+Export functions alongside `name` and `setup`. Hooks require the plugin via `#plugins/*` — lazy resolution means `setup` runs before any hook fires, so any client you initialise in `setup` is guaranteed ready by request time.
+
+```js
+// plugins/mailer.js
+let client = null;
+
+async function sendEmail({ to, subject, body }) {
+  if (!client) throw new Error('mailer not initialised');
+  return client.send({ to, subject, body });
+}
+
+module.exports = {
+  name: 'mailer',
+  async setup({ log }) {
+    client = initMailClient(process.env.SMTP_URL);
+    log.info({}, 'mailer ready');
+  },
+  sendEmail,
+};
+```
+
+```js
+// schema/versions/v1/user.js
+const mailer = require('#plugins/mailer');
+
+module.exports = {
+  path: 'user',
+  hooks: {
+    afterCreate: async ({ record, req }) => {
+      try {
+        await mailer.sendEmail({ to: record.email, subject: 'Welcome!', body: '...' });
+      } catch (err) {
+        (req?.log || console).error({ err }, 'welcome email failed');
+      }
+    },
+  },
+};
+```
+
+## First-party plugins
+
+<CardGroup cols={2}>
+  <Card title="Auth Plugins" icon="lock" href="/plugins/auth">
+    Magic-link passwordless login, OAuth social sign-in (Google, GitHub, Microsoft, Apple, Discord), and SMS OTP / TOTP 2FA via Twilio.
+  </Card>
+  <Card title="Stripe" icon="credit-card" href="/plugins/stripe">
+    Checkout sessions, customer portal, subscription state mirroring, and webhook fan-out to the record bus.
+  </Card>
+  <Card title="Messaging" icon="bell" href="/plugins/messaging">
+    Slack alerts, transactional email via Postmark (with inbound parsing), and SMS / WhatsApp via Twilio.
+  </Card>
+  <Card title="Search" icon="magnifying-glass" href="/plugins/search">
+    Full-text search with Typesense, Meilisearch, or Algolia. Auto-indexes records and adds tenant-scoped REST + GraphQL surfaces.
+  </Card>
+  <Card title="Storage" icon="hard-drive" href="/plugins/storage">
+    Direct-to-bucket uploads via AWS S3, Cloudflare R2, Google Cloud Storage, or MinIO. Files never proxy through the API server.
+  </Card>
+  <Card title="Jobs & Queues" icon="clock" href="/plugins/queue">
+    Durable background jobs via BullMQ and declarative scheduled cron jobs with Mongo-backed distributed locking.
+  </Card>
+  <Card title="Observability" icon="chart-bar" href="/plugins/observability">
+    Sentry error tracking with automatic secret redaction, and an immutable queryable audit log with REST + GraphQL access.
+  </Card>
+</CardGroup>
+
+## Error handling
+
+### Boot-time failures
+
+A throw inside `setup` fails the entire process boot. This is intentional — silently dropping a misconfigured plugin would hide problems from operators. If your plugin can tolerate a missing downstream service at boot, log a warning and let `setup` resolve instead of throwing.
+
+### Runtime failures in plugin routes
+
+The framework calls `schemaLoader.moveErrorHandlerToEnd()` after every plugin finishes, so the terminal `errorHandler` is re-spliced to the tail of the stack. Errors thrown in plugin routes produce the standard response shape:
+
+```json
+{ "error": { "code": "...", "message": "..." } }
+```
+
+### Runtime failures in event handlers
+
+Event-bus handlers run outside the request lifecycle — a thrown error cannot reach the client. Always wrap handlers:
+
+```js
+bus.on('record', async (event) => {
+  try {
+    await heavySideEffect(event);
+  } catch (err) {
+    log.error({ err, event }, 'plugin event handler failed');
+  }
+});
+```
+
+## Publish a plugin as an npm package
+
+Follow these conventions to share a plugin with other dAvePi projects:
+
+<Steps>
+  <Step title="Name it">
+    Use the `davepi-plugin-<thing>` naming convention so it's discoverable.
+  </Step>
+  <Step title="Export the shape">
+    Make the package's `main` export the `{ name, setup }` object directly.
+  </Step>
+  <Step title="Document env vars">
+    List every required and optional environment variable in the README.
+  </Step>
+  <Step title="Declare the peer dependency">
+    Add `davepi` to `peerDependencies` so consumers control the framework version.
+  </Step>
+</Steps>

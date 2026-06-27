@@ -1,0 +1,248 @@
+---
+title: "Auto-Generated GraphQL API Reference for dAvePi"
+sidebarTitle: "GraphQL"
+description: "Apollo Server ships out of the box at /graphql/ with full queries, mutations, relations, and state-machine transitions generated per schema."
+---
+
+dAvePi ships Apollo Server v5 at `/graphql/` with zero configuration. When the server boots, it walks your schema registry, composes a Mongoose-derived type per resource via `graphql-compose-mongoose`, wraps every resolver for tenant scoping, and serves the result. Add a schema file and the corresponding queries and mutations appear automatically — the same source of truth that drives your REST routes.
+
+## Generated operations per schema
+
+For a schema with `path: 'account'`, dAvePi generates the following resolver names:
+
+| Operation | Resolver |
+|-----------|----------|
+| Find one by ID | `accountById(_id)` |
+| Find many by IDs | `accountByIds(_ids)` |
+| Find one by filter | `accountOne(filter, sort)` |
+| Find many by filter | `accountMany(filter, sort, limit, skip)` |
+| Count | `accountCount(filter)` |
+| Relay connection | `accountConnection(filter, ...)` |
+| Paginated list | `accountPagination(filter, page, perPage)` |
+| Full-text search | `accountSearch(q, filter, sort)` — when any field has `searchable: true` |
+| Audit history | `accountHistory(_id)` — on audit-enabled schemas |
+| Named aggregation | `account<AggregationName>(args)` — one per declared aggregation |
+| Create one | `accountCreateOne(record)` |
+| Create many | `accountCreateMany(records)` |
+| Update by ID | `accountUpdateById(_id, record)` |
+| Update one by filter | `accountUpdateOne(filter, record)` |
+| Update many by filter | `accountUpdateMany(filter, record)` |
+| Remove by ID | `accountRemoveById(_id)` |
+| Remove many | `accountRemoveMany(filter)` |
+| Restore | `accountRestore(_id)` — on soft-delete-enabled schemas |
+| State-machine transition | `<path>Transition<Field>(_id, to)` — one per state-machine field, `to` typed as a generated enum |
+
+---
+
+## Auth
+
+Use the same Bearer JWT as the REST surface. The Apollo integration middleware reads `Authorization: Bearer <token>`, verifies it against `TOKEN_KEY`, and exposes `ctx.user` with `{ user_id, email, roles }` for every resolver.
+
+```js
+// Apollo Server v4+ attaches the context resolver on the Express integration.
+app.use('/graphql', expressMiddleware(server, {
+  context: async ({ req }) => ({
+    user: req.user,   // populated by auth middleware
+  }),
+}));
+```
+
+Resolvers without a valid auth context are rejected before they run. The check is built into the tenant-scoping wrappers — you cannot bypass it by calling a resolver directly.
+
+---
+
+## Fetching records with relations
+
+Relations declared in your schema's `relations` map appear as nested fields on the GraphQL type. `hasMany` relations accept a `filter` argument; `hasOne` and `belongsTo` relations return a single object.
+
+```graphql
+{
+  accountById(_id: "abc") {
+    name
+    contacts(filter: {}) {
+      _id
+      name
+      email
+    }
+    primaryContact {
+      _id
+      name
+    }
+  }
+}
+```
+
+See [Relations](/features/relations/) for schema-side configuration.
+
+---
+
+## Creating and updating records
+
+<CodeGroup>
+```graphql Create a record
+mutation {
+  accountCreateOne(record: {
+    accountName: "Acme Inc"
+    industry: "manufacturing"
+  }) {
+    recordId
+    record {
+      _id
+      accountName
+      industry
+      createdAt
+    }
+  }
+}
+```
+
+```graphql Update a record
+mutation {
+  accountUpdateById(_id: "abc", record: {
+    industry: "technology"
+  }) {
+    recordId
+    record {
+      _id
+      accountName
+      industry
+      updatedAt
+    }
+  }
+}
+```
+</CodeGroup>
+
+The `record` input type excludes server-stamped ownership fields (`userId`, `accountId`) and computed fields — the framework stamps them from the JWT automatically.
+
+---
+
+## Input types
+
+dAvePi generates three input types per schema:
+
+| Type | Used for | Excludes |
+|------|----------|---------|
+| `<Path>Input` | `CreateOne` mutations | Computed fields, file fields, `userId`, `accountId` |
+| `<Path>UpdateInput` | Partial update mutations | Same exclusions, plus all required fields are nullable |
+| `<Path>FilterInput` | Filter arguments on query resolvers | All readable fields, with mongo-querystring operators |
+
+---
+
+## State-machine transitions
+
+State-machine fields appear as a `enum` type on the output type, and dAvePi generates a dedicated transition mutation per field. The `to` argument is typed as the schema's generated enum, so a typo is caught at the GraphQL layer before any handler runs.
+
+```graphql
+mutation {
+  quoteTransitionStatus(_id: "abc", to: approved) {
+    record {
+      _id
+      status
+      availableTransitions {
+        status
+      }
+    }
+  }
+}
+```
+
+The transition runs the same validate / persist / audit / event pipeline as `PUT /:id` on the REST surface. You can also pass the new state value through the standard `updateById` resolver — the state machine validates it either way, but the dedicated transition mutation is the preferred call shape.
+
+`INVALID_TRANSITION` errors surface in `errors[0].extensions` for clients to react to programmatically.
+
+---
+
+## Soft delete
+
+List resolvers include a `deletedAt: null` predicate by default. Pass `_includeDeleted: true` on `Many`, `One`, `Count`, or `Search` resolvers to include tombstoned records. `accountRemoveById` performs a soft-delete; `accountRestore` clears the tombstone.
+
+---
+
+## Tenant scoping
+
+Every resolver is wrapped via helpers in `utils/scopeResolver.js`. The wrapper injects `userId: ctx.user.user_id` into the filter before the resolver runs — queries are always scoped to the authenticated user.
+
+<Warning>
+If you write a custom resolver, wrap it with the appropriate helper (`wrapFilter`, `wrapCreateOne`, `wrapByIdMutation`, etc.). Going directly to a Mongoose model bypasses tenant scoping entirely.
+</Warning>
+
+```js
+const { wrapFilter } = require('./utils/scopeResolver');
+
+tc.addResolver({
+  name: 'accountsWithDeals',
+  resolve: wrapFilter(
+    { schema, kind: 'read' },
+    async (rp, ctx) => {
+      // rp.args.filter already has userId injected; query freely.
+    }
+  ),
+});
+```
+
+---
+
+## Apollo Sandbox in development
+
+In `NODE_ENV !== 'production'`, the Apollo Sandbox is available at `/graphql/`. Navigate there in your browser to explore the schema, run queries, and test mutations interactively. Introspection is also gated on the dev environment.
+
+In production, both the Sandbox and introspection are disabled by default. Override the `introspection` flag in `app.js` if you need introspection in production.
+
+<Tip>
+Start with `npx create-davepi-app my-app --template crm` and open `http://localhost:5050/graphql/` — you get a fully populated CRM schema to explore immediately.
+</Tip>
+
+---
+
+## A fragment of a generated schema type
+
+Here is what the GraphQL type for an `account` schema looks like after generation:
+
+```graphql
+type Account {
+  _id: MongoID!
+  userId: String!
+  accountName: String!
+  industry: String
+  isActive: Boolean
+  createdAt: Date
+  updatedAt: Date
+  deletedAt: Date
+  availableTransitions: AccountAvailableTransitions
+
+  # Populated when __include contains 'contacts'
+  contacts: [Contact]
+  primaryContact: Contact
+}
+
+enum AccountStatusEnum {
+  active
+  suspended
+  closed
+}
+
+input CreateOneAccountInput {
+  accountName: String!
+  industry: String
+}
+```
+
+---
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="REST API" icon="server" href="/surfaces/rest">
+    The same surface, REST shape.
+  </Card>
+  <Card title="Relations" icon="link" href="/features/relations">
+    How nested fields are declared and resolved.
+  </Card>
+  <Card title="Tenant Isolation" icon="lock" href="/concepts/tenancy">
+    Why every resolver is wrapped before it runs.
+  </Card>
+  <Card title="Hot Reload" icon="rotate" href="/concepts/hot-reload">
+    How the schema is swapped live in development.
+  </Card>
+</CardGroup>

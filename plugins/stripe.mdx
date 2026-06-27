@@ -1,0 +1,221 @@
+---
+title: "Stripe Billing Plugin — Checkout, Portal & Webhooks"
+sidebarTitle: "Stripe"
+description: "Add Stripe checkout sessions, customer portal, subscription state mirroring, and verified webhook fan-out to your dAvePi app in minutes."
+---
+
+`davepi-plugin-stripe` wires Stripe billing into your dAvePi app with three HTTP routes, two auto-registered schema-driven collections, and a programmatic API you can call from lifecycle hooks. Subscription state is mirrored to MongoDB on every webhook event so you can query it with the same REST and GraphQL surfaces as any other resource — no Stripe SDK calls needed in your frontend.
+
+## Install
+
+```bash
+npm install davepi-plugin-stripe stripe
+```
+
+Register the plugin in your project's `package.json`:
+
+```json
+{
+  "davepi": {
+    "plugins": ["davepi-plugin-stripe"]
+  }
+}
+```
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `STRIPE_SECRET_KEY` | yes (else dormant) | — | `sk_test_…` or `sk_live_…` from your Stripe dashboard. |
+| `STRIPE_WEBHOOK_SECRET` | yes for webhook | — | `whsec_…` signing secret for `Stripe-Signature` verification. |
+| `STRIPE_WEBHOOK_PATH` | no | `/api/webhooks/stripe` | Empty string disables the route. |
+| `STRIPE_CHECKOUT_PATH` | no | `/api/checkout` | Empty string disables the route. |
+| `STRIPE_PORTAL_PATH` | no | `/api/portal` | Empty string disables the route. |
+| `STRIPE_API_VERSION` | no | latest | Pin to a specific Stripe API version to prevent surprise drift. |
+| `STRIPE_AUTOMATIC_TAX` | no | `false` | Toggles Stripe Tax on Checkout sessions. |
+
+<Note>
+If `STRIPE_WEBHOOK_PATH` is set but `STRIPE_WEBHOOK_SECRET` is missing, the webhook route is **not** mounted. An unverified webhook endpoint is worse than no endpoint at all.
+</Note>
+
+## Routes
+
+### POST /api/checkout
+
+Requires a valid Bearer JWT (client-id callers are refused with `403`). Auto-creates a Stripe customer for the user on the first call and records `stripeCustomerId` on the User document.
+
+**Request:**
+```json
+{
+  "priceId": "price_xyz",
+  "mode": "subscription",
+  "successUrl": "https://app.example.com/billing/success",
+  "cancelUrl": "https://app.example.com/billing/cancel",
+  "quantity": 1,
+  "allowPromotionCodes": true
+}
+```
+
+**Response:**
+```json
+{ "url": "https://checkout.stripe.com/c/pay/cs_test_…", "id": "cs_test_…" }
+```
+
+Redirect the browser to `url` and Stripe handles the payment UI.
+
+### POST /api/portal
+
+Requires a valid Bearer JWT. Returns a Billing Portal session URL so the user can manage their subscription, update payment methods, and view invoices.
+
+**Request:**
+```json
+{ "returnUrl": "https://app.example.com/account" }
+```
+
+**Response:**
+```json
+{ "url": "https://billing.stripe.com/p/session/…" }
+```
+
+### POST /api/webhooks/stripe
+
+Public endpoint. Stripe POST verified events here. The plugin:
+
+1. Verifies the `Stripe-Signature` header (timing-safe HMAC via the Stripe SDK).
+2. Inserts `event.id` into `stripe_event_seen` (TTL 7 days). Duplicate → `200` and short-circuit, preventing double-processing on Stripe retries.
+3. ACKs Stripe with `200 { received: true }` immediately.
+4. Syncs the `stripe_subscription` mirror for `customer.subscription.*` events.
+5. Rebroadcasts on the framework's record bus as `stripe.<event.type>` so audit, Slack, and Postmark plugins can react without extra wiring.
+
+## Auto-registered collections
+
+The plugin registers two schema-driven resources at boot. Standard REST and GraphQL surfaces are generated automatically.
+
+### stripe_subscription
+
+A local mirror of Stripe subscription state, kept current by the webhook handler. Tenant-scoped by `userId`.
+
+| Field | Description |
+|-------|-------------|
+| `status` | Stripe subscription status (`active`, `canceled`, `past_due`, etc.). |
+| `priceId` | The price the subscription is on. |
+| `currentPeriodEnd` | When the current billing period ends. |
+| `cancelAtPeriodEnd` | Whether the subscription cancels at period end. |
+| `raw` | Full last subscription object from Stripe — read any field without a schema migration. |
+
+Query subscriptions the same way you query any dAvePi resource:
+
+```bash
+GET /api/v1/stripe_subscription?status=active
+```
+
+```graphql
+query {
+  stripeSubscriptionFindMany(filter: { status: "active" }) {
+    _id
+    status
+    priceId
+    currentPeriodEnd
+  }
+}
+```
+
+### stripe_event_seen
+
+Idempotency deduplication store. Every processed Stripe event ID is recorded here with a 7-day TTL so retried deliveries are short-circuited.
+
+## Programmatic API
+
+Call the plugin's helpers from schema lifecycle hooks or custom routes:
+
+<CodeGroup>
+```js Create a checkout session
+const stripe = require('davepi-plugin-stripe');
+
+// From a schema lifecycle hook or custom route:
+const session = await stripe.createCheckoutSession({
+  user:      req.user,
+  priceId:   'price_xyz',
+  mode:      'subscription',
+  successUrl: 'https://app.example.com/billing/success',
+  cancelUrl:  'https://app.example.com/billing/cancel',
+});
+// Redirect to session.url
+res.redirect(303, session.url);
+```
+
+```js Create a portal session
+const stripe = require('davepi-plugin-stripe');
+
+const portal = await stripe.createPortalSession({
+  user:      req.user,
+  returnUrl: 'https://app.example.com/account',
+});
+res.redirect(303, portal.url);
+```
+
+```js Subscribe to webhook events
+const stripe = require('davepi-plugin-stripe');
+
+// React to specific Stripe events from anywhere in your app.
+stripe.onWebhookEvent('customer.subscription.updated', async (event) => {
+  // event is the raw Stripe Event object.
+  const sub = event.data.object;
+  console.log('subscription updated:', sub.id, sub.status);
+});
+```
+
+```js Direct SDK access
+const stripe = require('davepi-plugin-stripe');
+
+// Escape hatch: call Stripe APIs directly.
+const invoices = await stripe.client.invoices.list({ customer: 'cus_…' });
+```
+</CodeGroup>
+
+<Warning>
+All programmatic helpers throw with a clear message if called while the plugin is dormant (i.e., before `STRIPE_SECRET_KEY` is set). Wrap calls in `try/catch` inside `after*` hooks.
+</Warning>
+
+## Example: trigger checkout from an order hook
+
+```js
+// schema/versions/v1/order.js
+const stripe = require('davepi-plugin-stripe');
+
+module.exports = {
+  path: 'order',
+  fields: [
+    { name: 'planId',  type: 'String', required: true },
+    { name: 'status',  type: 'String', default: 'pending' },
+  ],
+  hooks: {
+    afterCreate: async ({ record, req }) => {
+      try {
+        const session = await stripe.createCheckoutSession({
+          user:       req.user,
+          priceId:    record.planId,
+          mode:       'subscription',
+          successUrl: `${process.env.APP_URL}/orders/${record._id}/success`,
+          cancelUrl:  `${process.env.APP_URL}/orders/${record._id}/cancel`,
+        });
+        // Store the checkout session ID on the record for later lookup.
+        await req.app.locals.models.order.findByIdAndUpdate(
+          record._id,
+          { checkoutSessionId: session.id }
+        );
+      } catch (err) {
+        (req?.log || console).error({ err }, 'checkout session creation failed');
+      }
+    },
+  },
+};
+```
+
+## Webhook raw-body requirement
+
+Stripe signature verification requires the raw request bytes. The framework's `express.json()` mount uses a `verify` callback that stashes the raw buffer on `req.rawBody` — the webhook handler reads that buffer. If you're on a framework version older than the one that ships this hook, the webhook handler returns `400` with a diagnostic message pointing at the cause.
+
+## Customer creation race
+
+Two concurrent first-hits from the same user could race to create two Stripe customers. The plugin uses an `Idempotency-Key` of `davepi-customer-<user_id>` on `customers.create` so Stripe coalesces the duplicate server-side. Both resulting IDs remain valid on the Stripe side.

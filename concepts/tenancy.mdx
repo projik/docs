@@ -1,0 +1,136 @@
+---
+title: "Tenant Isolation: How dAvePi Keeps Data Separate"
+sidebarTitle: "Tenancy"
+description: "Every read scopes to the authenticated user's JWT, every write stamps ownership, and no surface can bypass it without an explicit ACL declaration."
+---
+
+Tenant isolation is the most important invariant dAvePi enforces. Every read scopes to the authenticated user, every write stamps that user as owner, and every relation re-applies the scope on traversal. Breaking this would be a critical security bug — the framework treats it as non-bypassable by default.
+
+## The core contract
+
+Every schema must declare a `userId` field. When a user creates a record, the framework stamps `userId` from their JWT — clients never supply it. When a user reads a record, the framework adds `userId` to the MongoDB filter. When a relation traverses to a child collection, the child query also filters by `userId`.
+
+```
+JWT issued at /login
+    ↓
+{ user_id: "abc..." }   ← signed, server-verified
+    ↓
+auth(true) middleware
+    ↓
+req.user.user_id available everywhere downstream
+    ↓
+Every Mongoose query: { ...filter, userId: req.user.user_id }
+```
+
+<Warning>
+  The schema loader **refuses to load** any schema whose `fields` array does not declare a persisted `userId` field. The server fails loud at boot rather than silently leaking cross-tenant rows. If you intentionally want a non-tenant collection (a global system table, for example), declare `tenantScoped: false` on the schema — see below.
+</Warning>
+
+## Where enforcement happens
+
+dAvePi applies the scope at every surface independently, so there is no path that bypasses it by accident:
+
+| Surface | Enforcement point |
+|---------|-------------------|
+| REST `POST` | `utils/schemaLoader.js` stamps `userId` from `req.user.user_id` after `filterWritable` runs. |
+| REST `GET` (list / single) | `userId: req.user.user_id` is injected into the Mongo filter before the find. |
+| REST `PUT` (single / bulk) | Ownership query carries `userId`. Bulk `PUT` always forces `userId` into the upsert filter and is never bypassed. |
+| REST `DELETE` | Same ownership filter applied before delete. |
+| GraphQL | `wrapFilter` / `wrapByIdMutation` / `wrapFindById` in `utils/scopeResolver.js` inject `userId` into `rp.args.filter` before the resolver runs. |
+| MCP tools | Tool handlers go through the same Mongoose models with the same scoping. |
+| Aggregations | `runAggregation` prepends `$match: { userId }` as the first pipeline stage — even `unsafe: true` aggregations cannot return cross-tenant rows. |
+| Relations (`__include`) | Each related query re-applies `userId` against the target collection. |
+
+## ACL bypass slots for admin roles
+
+Some roles — admin staff, customer support, internal tooling — need to read or modify records they don't own. A schema can opt specific roles into bypass:
+
+```js
+module.exports = {
+  path: 'order',
+  fields: [...],
+  acl: {
+    list: ['admin'],    // these roles see all rows on list / findMany
+    write: ['admin'],   // these roles can update records they don't own
+    delete: ['admin'],  // these roles can delete records they don't own
+  },
+};
+```
+
+<Note>
+  Ownership **never moves** under a write bypass. The framework strips `userId` and `accountId` from the update payload, so the record stays owned by its original tenant. There is no `create` bypass — create always stamps ownership from the JWT.
+</Note>
+
+The `write` bypass applies to: REST `PUT /:id`, GraphQL `UpdateById` / `UpdateOne` / `UpdateMany`, state-machine transition mutations, and the MCP `update_<path>` tool. The bulk `PUT /<path>` upsert remains owner-only because its filter doubles as the insert seed.
+
+## Field-level ACL
+
+You can restrict which roles see a specific field:
+
+```js
+{ name: 'salary', type: Number, acl: { read: ['admin', 'hr'] } }
+```
+
+`projectByAcl` strips the field from responses for any caller without a matching role. The same projection runs on webhook payloads and audit-log diffs — there is no side channel that bypasses field-level ACL.
+
+## The two sentinel fields: `userId` and `accountId`
+
+Every record receives both `userId` and `accountId` stamped from the JWT. For most projects these are the same value. For multi-org models, treat `userId` as identity and `accountId` as the org-level tenant; use a custom relation field (such as `parentAccountId`) for record-level foreign keys.
+
+<Warning>
+  Do **not** use `accountId` as a custom foreign key. The framework stamps `accountId` automatically on every record. A client-supplied value is clobbered by the stamping pass. Name custom foreign keys something distinct — `parentAccountId`, `orgId`, etc. Every starter template follows this convention.
+</Warning>
+
+## Public-read access without a JWT
+
+For storefronts, marketing sites, and other unauthenticated frontends, dAvePi resolves an `X-Client-Id` request header into a role. Issue a public client ID through the admin-only `apiClient` resource, then declare which role bypasses owner scope and what mandatory filter limits their view:
+
+```js
+module.exports = {
+  path: 'product',
+  fields: [
+    { name: 'userId',    type: String,  required: true },
+    { name: 'name',      type: String,  required: true },
+    { name: 'published', type: Boolean, default: false },
+    { name: 'cost',      type: Number,  acl: { read: ['admin', 'user'] } },
+  ],
+  acl: {
+    list:  ['storefront', 'admin'],
+    scope: { storefront: { published: true } },
+  },
+};
+```
+
+The `storefront` role sees only records matching `acl.scope.storefront` (`published: true`). The filter is server-controlled and cannot be widened by the caller. Writes from client-authenticated callers are refused with `403`. When both `Authorization` and `X-Client-Id` are present, the Bearer token wins.
+
+## Non-tenant collections
+
+A global system table — a webhook-dedupe ledger, an operator diagnostics log — can opt out of the requirement:
+
+```js
+module.exports = {
+  path: 'webhookLog',
+  tenantScoped: false,
+  fields: [...],
+  acl: { list: ['admin'] },
+};
+```
+
+The opt-out is deliberately explicit. The default assumption is that a missing `userId` field is a mistake, not an intention.
+
+## What an attack looks like — and why it fails
+
+Without tenant scoping, a malicious User A could:
+- Pass `{ userId: 'b' }` in a POST body to plant a record under User B.
+- Pass a User B record's `_id` to `GET` / `PUT` / `DELETE`.
+- Use `__include=tasks` to read User B's child records via User A's parent.
+- Use a GraphQL mutation `accountUpdateMany(filter: {})` to update every record.
+
+dAvePi closes every one of these:
+
+- `POST`: `userId` is stamped server-side; any client-supplied value is ignored.
+- `GET / PUT / DELETE` by id: the filter includes `userId`, so a borrowed `_id` returns `404`.
+- `__include`: the related query re-applies `userId`.
+- GraphQL bulk: `wrapFilter` injects `userId` into the filter.
+
+The cross-tenant isolation tests in `test/` cover every surface — REST, GraphQL, MCP, relations, and aggregations — as a structural regression guard.

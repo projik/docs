@@ -1,0 +1,274 @@
+---
+title: "Agent Channels: HTTP, Slack, and Custom Adapters"
+sidebarTitle: "Channels"
+description: "Wire your dAvePi agent to users via HTTP /chat SSE, Slack @-mention and DM, or build a custom channel adapter in ~150 lines."
+---
+
+A **channel** is a thin adapter between an external messaging surface and the agent's `runTurn` orchestrator. Every channel does the same four things: receive an inbound message, build a `channelCtx` identifying the conversation, drive `runTurn` and stream events back, then translate structured `render` events into the platform's native UI.
+
+The HTTP and Slack channels are first-class. Telegram, WhatsApp, and an embeddable web widget ship as stubs in `lib/channels/templates/` — one-screen recipes that mirror the Slack shape so contributing a real one is one file plus the platform SDK.
+
+## HTTP channel
+
+The HTTP channel is the default — always on unless you set `AGENT_HTTP_ENABLED=false`. It listens on port `5060` (override with `AGENT_HTTP_PORT` or `PORT`).
+
+### Endpoints
+
+| Endpoint | Notes |
+|---|---|
+| `GET /health` | Liveness probe. Returns `{ ok, agent, auth }`. |
+| `POST /chat` | Chat endpoint. SSE-streaming by default; pass `"stream": false` for plain JSON. |
+| `GET /link/:nonce` | Per-user mode only. Serves the email/password HTML form. |
+| `POST /link/:nonce` | Per-user mode only. Form submission; calls dAvePi `/login` server-side. |
+
+### Request shape
+
+```http
+POST /chat
+Content-Type: application/json
+
+{
+  "message": "What products do we have?",
+  "history": [],
+  "stream": true
+}
+```
+
+- `message` (required) — the user's turn.
+- `history` (optional) — array of `{ role: 'user' | 'assistant', content }` pairs. In service mode the client round-trips history itself; in per-user mode the agent loads persisted history from the `conversation` schema.
+- `stream` (optional, default `true`) — SSE stream if `true`, plain JSON if `false`.
+
+### Streaming response (SSE)
+
+When `stream: true` the response content type is `text/event-stream`. Events arrive in this sequence:
+
+| Event | Payload |
+|---|---|
+| `tool_call` | `{ type: 'tool_call', name, args }` — the model is calling a tool. |
+| `tool_result` | `{ type: 'tool_result', name, result }` — the tool's return value. |
+| `token` | `{ type: 'token', text }` — one streaming chunk of the assistant's text. |
+| `render` | `{ type: 'render', payload: { type: 'table' \| 'chart', ... } }` — a structured visualization. |
+| `cache` | `{ type: 'cache', cacheReadInputTokens, cacheCreationInputTokens }` — Anthropic cache usage (Anthropic only). |
+| `final` | `{ type: 'final', text, history }` — the assembled reply plus updated history. |
+| `done` | `{ ok: true }` — end of stream. |
+| `error` | `{ code, message }` — mid-stream failure. The stream ends after this event. |
+
+### Non-streaming response (JSON)
+
+```json
+{
+  "text": "Here are your top 5 products.\n…",
+  "history": [
+    { "role": "user", "content": "What products do we have?" },
+    { "role": "assistant", "content": "Here are your top 5 products.\n…" }
+  ],
+  "events": [
+    { "type": "tool_call", "name": "list_product", "args": {} },
+    { "type": "tool_result", "name": "list_product", "result": {} },
+    { "type": "render", "payload": { "type": "table" } },
+    { "type": "final", "text": "...", "history": [] }
+  ]
+}
+```
+
+### CORS
+
+Set `AGENT_CORS_ORIGINS` to a comma-separated allowlist of origins. In per-user mode the agent automatically emits `Access-Control-Allow-Credentials: true` for any allowed origin so the session cookie round-trips:
+
+```bash
+AGENT_CORS_ORIGINS=https://app.example.com,https://staging.example.com
+```
+
+### Browser client example
+
+```html
+<script type="module">
+const r = await fetch('/chat', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  credentials: 'include',   // for the session cookie in per-user mode
+  body: JSON.stringify({ message: "show me last week's orders as a chart" }),
+});
+const reader = r.body.getReader();
+const dec = new TextDecoder();
+let buf = '';
+for (;;) {
+  const { value, done } = await reader.read();
+  if (done) break;
+  buf += dec.decode(value, { stream: true });
+  for (const frame of buf.split('\n\n')) {
+    if (!frame.trim()) continue;
+    const lines = frame.split('\n');
+    const ev = lines.find(l => l.startsWith('event: '))?.slice(7);
+    const data = JSON.parse(lines.find(l => l.startsWith('data: '))?.slice(6));
+    if (ev === 'token') write(data.text);
+    if (ev === 'render') renderTable(data.payload);  // your code
+  }
+  buf = buf.endsWith('\n\n') ? '' : buf.split('\n\n').pop();
+}
+</script>
+```
+
+A fuller working example ships at `packages/davepi-agent/demo/index.html`.
+
+## Slack
+
+The Slack channel turns on automatically when `SLACK_BOT_TOKEN` is set. It uses [`@slack/bolt`](https://slack.dev/bolt-js/concepts) under the hood and listens for:
+
+- **`app_mention`** in a channel → replies in thread.
+- **`message.im`** (DM to the bot) → replies in the DM.
+
+The conversation key is the thread (`channel::thread_ts`), not the user — so two threads from the same person are distinct transcripts and context does not bleed between them.
+
+### Slack app setup checklist
+
+<Steps>
+
+### Create the app
+
+Visit [https://api.slack.com/apps](https://api.slack.com/apps), click **Create New App → From scratch**, name it, and pick your workspace.
+
+### Add bot token scopes
+
+Go to **OAuth & Permissions → Bot Token Scopes** and add:
+- `app_mentions:read`
+- `chat:write`
+- `im:history`
+- `im:write`
+- `users:read`
+
+### Subscribe to bot events
+
+Under **Event Subscriptions → Subscribe to bot events**, add:
+- `app_mention`
+- `message.im`
+
+### Choose a transport
+
+<Tabs>
+  <Tab title="Socket mode (local dev)">
+    Under **Basic Information**, create an App-Level Token with scope `connections:write`. Then set:
+
+    ```bash
+    SLACK_APP_TOKEN=xapp-...
+    SLACK_SOCKET_MODE=true
+    ```
+
+    No public URL needed — great for local development.
+  </Tab>
+  <Tab title="HTTP mode (production)">
+    Expose the agent via your hosted URL or `ngrok` and set the Slack event URL to `https://<host>/slack/events`. Leave `SLACK_SOCKET_MODE=false` (the default).
+  </Tab>
+</Tabs>
+
+### Install the app
+
+Install the app to your workspace. Copy the **Bot User OAuth Token** to `SLACK_BOT_TOKEN` and the **Signing Secret** to `SLACK_SIGNING_SECRET`.
+
+### Start the agent and test it
+
+```bash
+SLACK_BOT_TOKEN=xoxb-... \
+SLACK_SIGNING_SECRET=... \
+npx davepi-agent
+```
+
+`@`-mention the bot in a channel or send it a DM.
+
+</Steps>
+
+### Render translation
+
+| `render` payload type | Slack output |
+|---|---|
+| `table` | Block Kit section with a markdown table. Wide tables (more than 10 columns) fall back to a fenced code block. |
+| `chart` | [QuickChart](https://quickchart.io) image URL embedded as a Block Kit `image` block. |
+
+Both render tools take strictly-typed Zod payloads, so the model can never emit raw HTML or SVG into Slack.
+
+### Per-user link flow on Slack
+
+In per-user mode, the first `@`-mention or DM from an unlinked user triggers an `UnlinkedError` inside `runTurn`. The Slack channel catches it and replies:
+
+```
+Please link your account first: https://agent.example.com/link/abc123…
+```
+
+The user clicks, completes the form, and the refresh token is stored against `slack:<user_id>`. Slack's signed event payload is the trust anchor — no cookie is needed on this channel.
+
+## Channel context (`channelCtx`)
+
+Every channel passes the same shape to `runTurn`:
+
+```js
+{
+  channel: 'slack',                          // or 'http', 'telegram', ...
+  channelUserId: 'U12345',                   // the platform's id for the speaker
+  conversationId: 'C0123::1700000000.000100',// per-thread scope
+  signal: undefined,                         // optional AbortSignal (cron uses it)
+}
+```
+
+- **`channel`** — short string that becomes the prefix in `endUserKey = ${channel}:${channelUserId}` for the customer profile lookup.
+- **`channelUserId`** — the platform's id (Slack user id, Telegram chat id, etc.).
+- **`conversationId`** — the **persistence key**. Slack threads, HTTP logged-in user, Telegram chat. Not the same as `channelUserId` — keying by user alone would collapse every Slack thread for one person into a single transcript.
+- **`signal`** — optional `AbortSignal` forwarded to MCP tool calls and the model stream. Used by cron jobs to cooperatively stop a turn if the lease is lost.
+
+## Building a custom channel
+
+Telegram, WhatsApp, and an embeddable widget ship as stubs — copy one as your starting point:
+
+- `packages/davepi-agent/lib/channels/templates/telegram.js`
+- `packages/davepi-agent/lib/channels/templates/whatsapp.js`
+- `packages/davepi-agent/lib/channels/templates/widget.js`
+
+A typical custom channel is about 150 lines. Follow these steps:
+
+<Steps>
+
+### Listen for inbound messages
+
+Use your platform's SDK (`node-telegram-bot-api`, Meta's WhatsApp Cloud API, etc.) to receive messages.
+
+### Derive `channelCtx`
+
+Build the `channelCtx` object from the inbound event. For platforms with a thread or conversation concept, set `conversationId` to that key so the persisted transcript scopes correctly.
+
+### Drive `runTurn`
+
+```js
+const { runTurn } = require('@davepi/agent/lib/orchestrator');
+
+const out = await runTurn({
+  config, model, mcpClient,
+  channelCtx,
+  history: getHistoryFor(channelCtx.conversationId),
+  userMessage: msg.text,
+  onEvent: (evt) => {
+    if (evt.type === 'token') append(evt.text);
+    if (evt.type === 'render') renderToPlatform(evt.payload);
+  },
+});
+```
+
+### Translate `render` events
+
+- `payload.type === 'table'` → a monospace block, an attached CSV, or your platform's native table primitive.
+- `payload.type === 'chart'` → a QuickChart URL embedded as a photo or image.
+
+### Handle `UnlinkedError` in per-user mode
+
+Surface `err.linkUrl` to the user with platform-appropriate instructions so they can complete the link flow.
+
+</Steps>
+
+## Running multiple channels in one process
+
+The agent process boots HTTP (always) and Slack (if `SLACK_BOT_TOKEN` is set) by default. They share the same `mcpClient`, `auth`, and `model` instance. To run only one channel:
+
+```bash
+AGENT_HTTP_ENABLED=false   # disable HTTP
+SLACK_ENABLED=false        # disable Slack even if SLACK_BOT_TOKEN is set
+```
+
+To add a custom channel inside the same process, use the [programmatic API](/agents/overview) — `createAgent` gives you the parts, and your code wires the new channel in.

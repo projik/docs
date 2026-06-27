@@ -1,0 +1,261 @@
+---
+title: "Object Storage Plugin — S3, R2, GCS & MinIO Uploads"
+sidebarTitle: "Storage"
+description: "Add direct-to-bucket file uploads to your dAvePi app. Files travel from client to bucket without proxying through your API server."
+---
+
+`davepi-plugin-object-storage` adds presigned-URL file uploads to your dAvePi app. Instead of routing file bytes through the API server (which burns memory, CPU, and doubles your egress), the plugin issues a short-lived presigned PUT URL directly to the client. The client uploads straight to the bucket, then calls `/complete` to confirm. The plugin supports AWS S3, Cloudflare R2, Google Cloud Storage, and self-hosted MinIO behind a unified API.
+
+The plugin also auto-registers a `file` schema so every uploaded file is a first-class, queryable, tenant-scoped resource with standard REST and GraphQL surfaces.
+
+## Install
+
+```bash
+npm install davepi-plugin-object-storage
+```
+
+```json
+{
+  "davepi": {
+    "plugins": ["davepi-plugin-object-storage"]
+  }
+}
+```
+
+The plugin stays dormant until `S3_BUCKET` is set.
+
+## Upload flow
+
+<Steps>
+  <Step title="Request a presigned PUT URL">
+    ```bash
+    POST /api/files/upload-url
+    Authorization: Bearer <token>
+    Content-Type: application/json
+
+    {
+      "contentType":  "image/png",
+      "originalName": "company-logo.png",
+      "size":         12345,
+      "metadata":     { "tag": "avatar" }
+    }
+    ```
+    ```json
+    { "fileId": "…", "key": "…", "url": "https://…", "expiresIn": 300, "contentType": "image/png" }
+    ```
+  </Step>
+  <Step title="PUT the bytes directly to the bucket">
+    The client uploads directly to the presigned URL. Your API server never sees the bytes.
+    ```js
+    await fetch(presign.url, {
+      method:  'PUT',
+      headers: { 'Content-Type': 'image/png' },
+      body:    blob,
+    });
+    ```
+  </Step>
+  <Step title="Mark the upload complete">
+    ```bash
+    POST /api/files/:fileId/complete
+    Authorization: Bearer <token>
+    ```
+    ```json
+    { "fileId": "…", "status": "uploaded", "size": 12345, "etag": "\"abc…\"" }
+    ```
+    The server HEAD-checks the object to verify presence and size, then flips the record's `status` to `uploaded`.
+  </Step>
+  <Step title="Fetch a download URL">
+    ```bash
+    GET /api/files/:fileId/download-url
+    Authorization: Bearer <token>
+    ```
+    ```json
+    { "fileId": "…", "url": "https://…", "expiresIn": 600 }
+    ```
+    The presigned GET URL is short-lived. Regenerate it on demand rather than caching it.
+  </Step>
+</Steps>
+
+## Environment variables (shared)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `S3_BACKEND` | no | `aws` | One of `aws` / `r2` / `minio` / `gcs`. |
+| `S3_BUCKET` | **yes** (else dormant) | — | Bucket name. |
+| `S3_PUT_URL_TTL_SECONDS` | no | `300` | Presigned PUT URL lifetime. |
+| `S3_GET_URL_TTL_SECONDS` | no | `600` | Presigned GET URL lifetime. |
+| `S3_MAX_BYTES` | no | `52428800` (50 MiB) | Maximum accepted upload size. |
+| `S3_ALLOWED_MIME` | no | *(any)* | Comma-separated MIME allowlist, e.g. `image/png,image/jpeg,application/pdf`. Wildcards like `image/*` are honoured. |
+| `S3_CASCADE_DELETE` | no | `false` | When `true`, deleting a `file` record also deletes the storage object. Irreversible — opt in explicitly. |
+| `S3_VERIFY_ON_COMPLETE` | no | `true` | HEAD-checks the object at `/complete` to verify presence and size. |
+| `S3_PUBLIC_BASE_URL` | no | computed | CDN base URL for `publicUrl` overrides. |
+| `S3_FILE_PATH` | no | `file` | Schema path. Override if your project already has a `file` schema. |
+| `S3_ROUTE_PREFIX` | no | `/api/files` | Where the three custom routes mount. |
+
+## Backend configuration
+
+<Tabs>
+  <Tab title="AWS S3">
+
+```bash
+S3_BACKEND=aws
+S3_BUCKET=my-uploads
+S3_REGION=us-east-1
+S3_ACCESS_KEY_ID=AKIA…
+S3_SECRET_ACCESS_KEY=…
+```
+
+In production with IAM roles (IRSA, EC2/ECS instance profile), omit `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` — the AWS SDK credential chain picks them up automatically.
+
+Add this CORS configuration to your bucket (Console → S3 → Bucket → Permissions → CORS):
+
+```json
+[
+  {
+    "AllowedHeaders": ["*"],
+    "AllowedMethods": ["PUT", "GET"],
+    "AllowedOrigins": ["https://app.example.com"],
+    "ExposeHeaders":  ["ETag"],
+    "MaxAgeSeconds":  3000
+  }
+]
+```
+
+  </Tab>
+  <Tab title="Cloudflare R2">
+
+R2 uses the S3-compatible API. Find your endpoint in the Cloudflare dashboard under *R2 → Bucket → Settings*.
+
+```bash
+S3_BACKEND=r2
+S3_BUCKET=my-uploads
+S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
+S3_ACCESS_KEY_ID=<R2 access key>
+S3_SECRET_ACCESS_KEY=<R2 secret key>
+```
+
+Add CORS at *Cloudflare Dashboard → R2 → Bucket → Settings → CORS Policy*:
+
+```json
+[
+  {
+    "AllowedHeaders": ["content-type", "content-length"],
+    "AllowedMethods": ["PUT", "GET"],
+    "AllowedOrigins": ["https://app.example.com"],
+    "ExposeHeaders":  ["ETag"]
+  }
+]
+```
+
+  </Tab>
+  <Tab title="Google Cloud Storage">
+
+```bash
+S3_BACKEND=gcs
+S3_BUCKET=my-uploads
+GCS_PROJECT_ID=my-gcp-project
+GCS_KEY_FILE=/run/secrets/gcs-service-account.json
+```
+
+Apply CORS with `gsutil`:
+
+```json
+[
+  {
+    "origin":         ["https://app.example.com"],
+    "method":         ["PUT", "GET"],
+    "responseHeader": ["Content-Type", "ETag"],
+    "maxAgeSeconds":  3000
+  }
+]
+```
+
+```bash
+gsutil cors set cors.json gs://my-uploads
+```
+
+  </Tab>
+  <Tab title="MinIO">
+
+```bash
+S3_BACKEND=minio
+S3_BUCKET=my-uploads
+S3_ENDPOINT=http://localhost:9000
+S3_ACCESS_KEY_ID=minioadmin
+S3_SECRET_ACCESS_KEY=minioadmin
+S3_FORCE_PATH_STYLE=true
+```
+
+Enable CORS via the `mc` CLI:
+
+```bash
+mc admin config set local cors_allow_origin="https://app.example.com"
+mc admin service restart local
+```
+
+  </Tab>
+</Tabs>
+
+## The file collection
+
+The plugin registers a `file` schema at boot. Every standard dAvePi surface is generated automatically.
+
+| Field | Writable | Description |
+|-------|----------|-------------|
+| `userId` | no | Owner — used for tenant-scope on every read. |
+| `key` | no | Storage key: `<userId>/<8-hex>/<safe-name>`. |
+| `bucket` | no | Bucket the object lives in. |
+| `contentType` | no | MIME type at upload time. |
+| `size` | no | Bytes, validated against `S3_MAX_BYTES`. |
+| `status` | no | `pending` → `uploaded`. Only the plugin's routes update this. |
+| `originalName` | **yes** | Client-supplied filename. |
+| `metadata` | **yes** | Free-form object. Attach labels via standard `PUT /api/v1/file/:id`. |
+| `uploadedAt` | no | Set by `/complete`. |
+| `etag` | no | Storage ETag at `/complete`. |
+
+```bash
+# List uploaded files, newest first
+GET /api/v1/file?status=uploaded&__sort=createdAt:desc
+
+# Update metadata
+PUT /api/v1/file/<id>
+{ "metadata": { "tag": "hero-image" } }
+
+# Delete the record (and the object if S3_CASCADE_DELETE=true)
+DELETE /api/v1/file/<id>
+```
+
+## Programmatic API
+
+Use the programmatic API from schema lifecycle hooks or custom plugins:
+
+```js
+const storage = require('davepi-plugin-object-storage');
+
+// Issue a presigned PUT URL from inside a hook.
+const { url, fileId } = await storage.createUploadUrl({
+  user:         req.user,
+  contentType:  'image/png',
+  originalName: 'avatar.png',
+  size:         12345,
+  metadata:     { kind: 'avatar' },
+});
+
+// Sign a short-lived GET URL.
+// Returns null if the file isn't owned by the caller.
+const dl = await storage.createDownloadUrl({ user: req.user, fileId });
+
+// Delete both the record and the storage object.
+await storage.deleteFile({ user: req.user, fileId });
+
+// Adapter escape hatch — call provider-specific APIs directly.
+const head = await storage.adapter.headObject({ key });
+```
+
+## Multi-tenant isolation
+
+Every route filters by `req.user.user_id`. Foreign-tenant `fileId`s return `404 NOT_FOUND` — never `403 FORBIDDEN`, so the response doesn't leak the existence of records that belong to other tenants. Storage keys are namespaced by `userId`, so a flat bucket listing already shows ownership without extra metadata.
+
+<Tip>
+The plugin coexists with the framework's built-in `type: 'File'` field. Use `type: 'File'` for small per-record attachments (avatars, scanned documents) and `davepi-plugin-object-storage` for media libraries, large files, or anything where the file is a first-class resource with its own lifecycle.
+</Tip>

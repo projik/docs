@@ -1,0 +1,81 @@
+---
+title: "dAvePi Agents: What They Are and How They Work"
+sidebarTitle: "Overview"
+description: "dAvePi agents are chat processes backed by your schema. Learn the two mental models, the JWT access boundary, and what you get out of the box."
+---
+
+A **dAvePi agent** is a chat process that connects to your dAvePi backend through its built-in MCP server, turning every schema's CRUD operations, relations, aggregations, and audit log into tools the model can call. It ships as the `@davepi/agent` package — pre-wired for HTTP `/chat` streaming, Slack, three LLM providers, two auth modes, and a learning layer (persona, memory, skills, and per-user profiles) backed by tenant-isolated dAvePi schemas.
+
+```
+┌──────────────┐   SSE / Slack / DM    ┌──────────────┐  MCP / HTTP  ┌──────────────┐
+│  end-user    │ ─────────────────────▶│  davepi      │ ────────────▶│  davepi      │
+│  (or widget) │                       │  agent       │              │  backend     │
+└──────────────┘                       │  (@davepi/   │              │  (your app)  │
+                                       │   agent)     │              └──────┬───────┘
+                                       └──────┬───────┘                     │
+                                              │  Anthropic / OpenAI / Ollama│  MongoDB
+                                              ▼                              ▼
+```
+
+## The one design rule
+
+The JWT (or `X-Client-Id` header) **is** the access boundary. The agent never re-implements ACL checks, and it never tries to constrain results through prompt text. If you want a public storefront bot to see only published products, declare a `schema.acl.scope[role]` filter on the dAvePi side — the MCP server applies it on every read and the agent never sees the filter.
+
+<Warning>
+  The wrong pattern — and the one to avoid — is a broad service token plus *"only show user X's data"* in the prompt. That is a confused-deputy bug. Persona, memory, skills, and per-user profiles shape behavior and tone; they are **never** an access-control mechanism.
+</Warning>
+
+## What you get out of the box
+
+| Capability | Details |
+|---|---|
+| **Channels** | HTTP `/chat` (SSE), Slack (`@`-mention + DM). Telegram, WhatsApp, and embeddable widget templates also ship as stubs. |
+| **LLM providers** | Anthropic (default, `claude-sonnet-4-5`), OpenAI (`gpt-4o`), Ollama (local, no key required). |
+| **Tool surface** | Every schema's CRUD, relations, aggregations, audit, and file ops — auto-derived from the MCP server. |
+| **Tool router** | When the backend exposes more than `AGENT_TOOL_LIMIT` (default 40) tools, the model picks a resource first, then loads its tools. |
+| **Render tools** | `render_table` and `render_chart` — channel-neutral structured output. Slack renders these as Block Kit + QuickChart images. |
+| **Auth** | Service-account (one JWT or client id) or per-user (OAuth-style link flow). |
+| **Learning layer** | Per-agent persona, slow-changing memory, per-end-user profile, and governed skills (runbooks). |
+| **Conversation history** | Persisted to dAvePi's `conversation` schema with a frozen prompt snapshot for Anthropic cache stability. |
+| **Proactive jobs** | Pair with `davepi-plugin-cron` to fire approved skills on a schedule. |
+| **Programmatic API** | `createAgent` / `runTurn` / `mcpClient` for embedding in your own process. |
+
+## Two mental models
+
+### Service-account agent
+
+One identity covers the whole bot. Every chat turn, every tool call, every MCP request uses the same token. This is the right model for anonymous storefronts (pair a client id with `schema.acl.scope[role]` filters) and internal "shared inbox" bots. It is the simplest deployment: one bearer token, no per-user linking, no refresh-token store.
+
+<Tip>
+  For a development loop, raise `ACCESS_TOKEN_TTL=2h` in your dAvePi server's `.env` so you are not minting a new token mid-session. The `2h` ceiling is a policy limit — do not exceed it in production.
+</Tip>
+
+### Per-user agent
+
+Each channel user maps to a real dAvePi user via a one-time link flow (email and password form served by the agent itself). The agent stores refresh tokens locally and mints short-lived access tokens on demand. This is the right model for customer-portal bots where each user must see only their own data, enforced by dAvePi's existing owner-scoping — no tenant filter to write.
+
+## Where to start
+
+<CardGroup cols={2}>
+  <Card title="Getting Started" icon="rocket" href="/agents/getting-started">
+    Boot an agent against a local dAvePi in 10 minutes, then test it with `curl`.
+  </Card>
+  <Card title="Auth Modes" icon="lock" href="/agents/auth">
+    Decide between service-account and per-user auth before you go to production.
+  </Card>
+  <Card title="Personas & Skills" icon="brain" href="/agents/personas-memory-skills">
+    Give your agent a voice, persistent memory, and governed runbooks.
+  </Card>
+  <Card title="Channels" icon="plug" href="/agents/channels">
+    Wire Slack, build a custom channel adapter, or embed a web widget.
+  </Card>
+  <Card title="Proactive Agents" icon="clock" href="/agents/proactive-agents">
+    Schedule SLA digests, follow-ups, and daily summaries with `davepi-plugin-cron`.
+  </Card>
+</CardGroup>
+
+## Multiple agents per tenant
+
+One tenant can run many agents — `support`, `sales`, `billing-ops`, `onboarding`. Each is a distinct process with its own `AGENT_KEY`, persona row, memory row, and skill set. They share the tenant's `customerProfile` rows, so what support learns about a customer is available to sales too.
+
+Run one process per agent (different `AGENT_KEY`), or build a dispatcher that mints per-agent instances from one shared process using `createAgent({ agent: { key } })`. See [Personas, Memory & Skills](/agents/personas-memory-skills) for the full multi-agent identity model.

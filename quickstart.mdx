@@ -1,47 +1,128 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get dAvePi Running in Under 60 Seconds"
+sidebarTitle: "Quickstart"
+description: "Scaffold a dAvePi project, boot MongoDB, seed sample data, and explore every generated surface — REST, GraphQL, Swagger, and MCP."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+dAvePi turns a plain JavaScript schema file into a running REST API, GraphQL endpoint, Swagger UI, MCP tool list, and admin SPA — all without writing route handlers. This guide takes you from a cold machine to a server with sample data in about 60 seconds.
 
 ## Prerequisites
 
-Before you begin, you must have:
+- **Node.js 18 or newer** — check with `node -v`
+- **Docker** (for the bundled MongoDB container) — or any MongoDB connection string you already have
+- About 60 seconds
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+## Steps
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+### Scaffold a new project
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+Pick a template closest to what you're building. The `crm` template is the most fully-featured starting point; choose `blank` if you want to begin empty.
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
+```bash
+npx create-davepi-app my-app --template crm
+cd my-app
+```
+
+<Note>
+  The scaffolder runs `npm install` for you automatically, so you can skip that step if you use a template.
+</Note>
+
+The available templates are:
+
+| Template | What you get |
+|----------|--------------|
+| `blank` | Minimal — one resource, full-text search. |
+| `crm` | Accounts / contacts / deals (state machine) / activities. |
+| `ticketing` | Tickets with two state machines + comments. |
+| `content` | Articles (editorial workflow), categories, file uploads. |
+| `b2b-saas` | Orgs / workspaces / invites / billing-event ledger. |
+
+### Boot MongoDB
+
+The scaffolder dropped a `docker-compose.yml` that runs MongoDB on the default port. Start it with:
+
+```bash
+docker compose up -d
+```
+
+If you already have a MongoDB instance, open the generated `.env` and update the `MONGO_URI` value instead.
+
+### Install dependencies and start the server
+
+```bash
+npm install
+npm start
+```
+
+The server picks an available port (default `5050`; the scaffolder probes and falls back automatically). Your terminal prints the URL it actually bound to:
+
+```
+{"level":"info","msg":"listening","port":5050}
+```
+
+### Seed sample data
+
+In a second terminal, run the seed script:
+
+```bash
+npm run seed
+```
+
+This registers a demo user (`demo@example.com` / `demo-password!`) and POSTs a realistic set of sample records so the surfaces have something to show.
+
+### Explore the generated surfaces
+
+Every schema file you drop under `schema/versions/v1/` produces all of these automatically:
+
+| Surface | URL |
+|---------|-----|
+| REST API | `http://localhost:5050/api/v1/<resource>` |
+| GraphQL playground | `http://localhost:5050/graphql/` |
+| Swagger UI | `http://localhost:5050/api-docs` |
+| Capability manifest | `http://localhost:5050/_describe` |
+| Admin SPA | `http://localhost:5173` — run `cd admin && npm install && npm run dev` |
+
+### Make your first authenticated request
+
+Grab a token for the demo user and call the `account` endpoint:
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:5050/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"demo@example.com","password":"demo-password!"}' \
+  | jq -r .accessToken)
+
+curl -s http://localhost:5050/api/v1/account \
+  -H "Authorization: Bearer $TOKEN" | jq '.results'
+```
+
+You should see the seeded account records come back as a JSON array.
+
+### Wire Claude Code via MCP
+
+The scaffolder dropped a `.mcp.json` with the MCP server pre-configured. Open the project folder in Claude Code and ask:
+
+> Add a `lostReason` field to deal that's only populated when stage is `lost`, and an aggregation that groups `lost` deals by reason.
+
+Claude reads the schema through the MCP `_describe` tool, edits or creates a file under `schema/versions/v1/`, and hot-reload picks it up — no restart needed.
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## What's next
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Schema-Driven Generation" icon="diagram-project" href="/concepts/schema-driven">
+    Understand how one schema file becomes REST, GraphQL, MCP, Swagger, and more — all kept in sync automatically.
+  </Card>
+  <Card title="CRM in 10 Minutes" icon="clock" href="/guides/crm-in-10-minutes">
+    A full walkthrough: scaffold, seed, extend with Claude, deploy, and generate a typed TypeScript client.
+  </Card>
+  <Card title="Tenant Isolation" icon="lock" href="/concepts/tenancy">
+    Learn how dAvePi guarantees that User A never sees User B's records across every surface.
+  </Card>
+  <Card title="Schema Reference" icon="book" href="/reference/schema">
+    Every field option, ACL slot, relation, and state machine declaration — all in one place.
+  </Card>
+</CardGroup>

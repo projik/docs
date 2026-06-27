@@ -1,0 +1,218 @@
+---
+title: "Schema File Reference: All Top-Level Keys"
+sidebarTitle: "Schema File"
+description: "Complete reference for a dAvePi schema file — every key the loader recognises, with examples and links to feature deep-dives."
+---
+
+A schema file is a CommonJS module that exports a single plain object. Drop one under `schema/versions/v1/` and dAvePi builds REST routes, GraphQL types, MCP tools, and Swagger documentation from it automatically — no code generation step, no restart required in development. The loader walks every file once at boot (and on every change when `HOT_RELOAD_SCHEMAS=true`).
+
+## Minimum viable schema
+
+Three keys are all you need to get a fully functional resource. Add the file, start the server, and your endpoints are live.
+
+```js
+module.exports = {
+  path: 'account',
+  collection: 'account',
+  fields: [
+    { name: 'userId', type: String, required: true },
+    { name: 'name',   type: String, required: true },
+  ],
+};
+```
+
+That's enough to mount REST routes, GraphQL types, MCP tools, and Swagger fragments for `account`.
+
+## Top-level keys
+
+Every key the loader recognises is listed below. Any key not in this table is silently ignored.
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `path` | string | **yes** | URL segment under `/api/v1/<path>`, GraphQL prefix, and MCP tool prefix. Must be unique across loaded schemas. |
+| `collection` | string | **yes** | MongoDB collection name. Conventionally matches `path`. |
+| `fields` | array | **yes** | Field definitions. See [Field Options](/reference/fields). |
+| `relations` | object | no | Relation graph (`belongsTo` / `hasOne` / `hasMany`) consumed by `__include` and per-relation MCP tools. |
+| `aggregations` | array | no | Declarative aggregation pipelines surfaced as REST, GraphQL, and MCP. |
+| `compositeIndex` | array | no | Array of Mongoose index specs. Plain key objects create unique indexes; use `{ fields: {...}, unique: false }` for a query index. |
+| `softDelete` | boolean \| object | no | Defaults to `true`. Set `false` for hard deletes. Use `{ retentionDays: N }` to auto-purge tombstones after N days. |
+| `audit` | boolean | no | Defaults to `true`. Set `false` to skip audit log writes for this schema. |
+| `tenantScoped` | boolean | no | Defaults to `true`. Set `false` for global/system-internal collections that have no tenant column. |
+| `acl` | object | no | Document-level role bypass slots (`list`, `write`, `delete`). |
+| `webhooks` | object | no | Outbound webhook subscriptions for create / update / delete / transitioned events. |
+| `hooks` | object | no | Per-resource lifecycle hooks: `beforeCreate`, `afterCreate`, `beforeUpdate`, `afterUpdate`, `beforeDelete`, `afterDelete`. |
+| `version` | string | no | Defaults to `v1`. Override when you need a non-default version segment. |
+
+## `fields`
+
+`fields` is an ordered array — order matters for Swagger output. Each entry is an object. See [Field Options](/reference/fields) for the full vocabulary.
+
+<Note>
+  The `userId` and `accountId` fields have special framework status. Declare them in `fields`, and the framework stamps their values from the JWT on every write. Clients can never supply them. Omitting `userId` from a tenant-scoped schema causes the loader to reject it at boot with a typed `ValidationError`.
+</Note>
+
+## `relations`
+
+Declare relationships between schemas here. The loader generates `__include` support, typed GraphQL fields, and per-relation MCP tools from this map.
+
+```js
+relations: {
+  // belongsTo: this schema holds the foreign key.
+  account: { belongsTo: 'account', fk: 'accountId' },
+
+  // hasMany: the OTHER schema holds the foreign key.
+  contacts: { hasMany: 'contact', fk: 'accountId' },
+
+  // hasOne: like hasMany but at most one match.
+  primaryAddress: { hasOne: 'address', fk: 'accountId', where: { isPrimary: true } },
+},
+```
+
+| Key | Description |
+|-----|-------------|
+| `belongsTo` / `hasOne` / `hasMany` | Exactly one — names the target schema's `path`. |
+| `fk` | Foreign key field name. For `belongsTo`, it lives on this schema; for `hasOne` / `hasMany`, on the target. Defaults to `<target>Id`. |
+| `where` | Optional filter applied to the target query. Useful for `hasOne` selections. |
+
+<Tip>
+  `field.reference` is a legacy shorthand for `belongsTo`. New schemas should use the `relations` map — it generates named accessors, MCP tools, and typed client methods.
+</Tip>
+
+## `aggregations`
+
+Declare MongoDB aggregation pipelines that surface as REST endpoints, GraphQL fields, and MCP tools. The framework prepends a `$match: { userId }` stage automatically — tenant scoping always applies.
+
+```js
+aggregations: [
+  {
+    name: 'countByStage',
+    description: 'Quote count grouped by stage for the authenticated user.',
+    pipeline: [
+      { $group: { _id: '$stage', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+    ],
+    cache: { ttlSeconds: 30 },
+    params: [
+      { name: 'since', type: 'date', match: { createdAt: { $gte: '$since' } } },
+    ],
+  },
+],
+```
+
+| Key | Description |
+|-----|-------------|
+| `name` | Unique within the schema. Becomes the URL segment and GraphQL field name. |
+| `description` | Surfaces in `_describe` and Swagger. |
+| `pipeline` | Mongo aggregation pipeline. Tenant scope is prepended automatically. |
+| `cache.ttlSeconds` | Optional in-process cache keyed per tenant. |
+| `params` | Typed declarative inputs. Each becomes a typed arg in `_describe`, GraphQL, and MCP. |
+| `unsafe` | Set `true` to restrict the aggregation to roles listed in `acl.list`. Tenant scope still applies. |
+
+## `compositeIndex`
+
+Pass an array of Mongoose index specs. A plain key object creates a **unique** index — the common case for per-tenant uniqueness. Use the long form with `unique: false` for a plain query index.
+
+```js
+compositeIndex: [
+  { userId: 1, slug: 1 },                             // unique per-tenant slug
+  { userId: 1, accountId: 1, year: 1, number: 1 },    // unique invoice numbering
+  { fields: { userId: 1, articleId: 1 }, unique: false }, // query index only
+],
+```
+
+<Warning>
+  Always include `userId` (or `accountId`) as the first key. Without it, a unique index creates a **global** constraint that crosses tenants, and a query index won't serve the tenant-scoped lookups the framework generates.
+</Warning>
+
+## `softDelete`
+
+Defaults to `true`. The framework adds a `deletedAt: Date` tombstone field, rewrites every list and get query with `deletedAt: null`, and turns DELETE into a tombstone write. A `POST /:id/restore` REST route, a `restore_<path>` MCP tool, and a matching GraphQL mutation are generated automatically.
+
+<CodeGroup>
+```js Hard-delete opt-out
+softDelete: false   // DELETE permanently removes the document
+```
+
+```js Auto-purge tombstones
+softDelete: { retentionDays: 30 }   // hard-delete tombstones older than 30 days
+```
+</CodeGroup>
+
+Set `SOFT_DELETE_RETENTION_DAYS` in your environment to apply a global default to every schema that doesn't specify its own.
+
+## `audit`
+
+Defaults to `true`. Every create / update / delete / restore / state-machine transition writes a row to the `audit_log` collection with before/after/diff projections. The history surfaces as a `history_<path>` MCP tool, a `historyByDoc` GraphQL field, and `GET /:id/history` on REST.
+
+```js
+audit: false   // no audit rows written; history endpoints are absent
+```
+
+## `acl`
+
+Document-level bypass slots that let privileged roles read, write, or delete records they don't own.
+
+```js
+acl: {
+  list:   ['admin', 'support'],  // read across tenants
+  write:  ['admin'],             // update another user's record
+  delete: ['admin'],             // delete another user's record
+},
+```
+
+<Note>
+  There is no `create` bypass — create always stamps ownership from the JWT. `write` listed roles can update another user's record, but tenant fields are stripped from the update so the record stays owned by the original user. Field-level ACL belongs on the field definition, not here.
+</Note>
+
+## `webhooks`
+
+Subscribe to outbound webhook deliveries for create, update, delete, and state transition events. The framework signs each delivery with HMAC-SHA256 and retries with exponential backoff.
+
+```js
+webhooks: {
+  events: ['created', 'updated', 'deleted', 'transitioned'],
+  endpoints: [
+    { url: 'https://hooks.example.com/davepi', secret: 'whsec_...' },
+  ],
+},
+```
+
+## `hooks`
+
+Declare any subset of the six lifecycle hooks. `before*` hooks run synchronously, can mutate the persisted input by returning a new value, and reject the operation by throwing. `after*` hooks run after persistence — thrown errors are logged but never fail the response.
+
+```js
+hooks: {
+  beforeCreate: async ({ input, user, req, schema }) => input,
+  afterCreate:  async ({ record, user, req, schema }) => {},
+  beforeUpdate: async ({ input, current, user, req, schema }) => input,
+  afterUpdate:  async ({ record, previous, user, req, schema }) => {},
+  beforeDelete: async ({ current, user, req, schema }) => {},
+  afterDelete:  async ({ record, user, req, schema }) => {},
+},
+```
+
+<Warning>
+  Bulk paths (`PUT /<path>` upsert) do **not** invoke hooks. Subscribe a plugin to the event bus if you need reactions to bulk operations.
+</Warning>
+
+## What you can't do from a schema file
+
+The schema file describes *data*, not *runtime*. These patterns belong elsewhere:
+
+<CardGroup cols={2}>
+  <Card title="Cross-cutting routes" icon="route">
+    Routes that span multiple schemas belong in a plugin or in `app.js` after the schema loop.
+  </Card>
+  <Card title="Auth flows" icon="lock">
+    Authentication routes live in `routes/auth/` and are hand-written.
+  </Card>
+  <Card title="Custom middleware" icon="layer-group">
+    Middleware belongs in `middleware/`. The schema file has no middleware hook.
+  </Card>
+  <Card title="Non-Mongo backends" icon="database">
+    dAvePi is Mongo-only by design. There is no alternate backend driver.
+  </Card>
+</CardGroup>
+
+Per-resource side effects — validate before save, fire an event on create, refuse a delete — belong on the schema in a `hooks` block.

@@ -1,0 +1,311 @@
+---
+title: "Authentication Plugins — Magic Link, OAuth, SMS OTP"
+sidebarTitle: "Auth Plugins"
+description: "Add passwordless email login, social OAuth sign-in, and SMS one-time-code authentication to your dAvePi app with three first-party plugins."
+---
+
+dAvePi ships JWT + bcrypt password authentication out of the box. These three plugins add passwordless flows on top: magic links sent by email, social sign-in via OAuth providers, and SMS one-time codes with optional TOTP two-factor authentication. All three issue the same `{ accessToken, refreshToken }` pair the rest of the framework already accepts, so your existing auth middleware needs no changes.
+
+<Tabs>
+  <Tab title="Magic Link">
+
+## davepi-plugin-magic-link
+
+`davepi-plugin-magic-link` adds passwordless email login. A user requests a link, receives a single-use token by email, and exchanges it for a standard dAvePi JWT. Only the SHA-256 hash of the emailed token is stored in MongoDB, so a database breach exposes nothing redeemable.
+
+### Install
+
+```bash
+npm install davepi-plugin-magic-link
+```
+
+```json
+{
+  "davepi": {
+    "plugins": ["davepi-plugin-magic-link"]
+  }
+}
+```
+
+The plugin stays **dormant** until `MAGIC_LINK_URL` is set — safe to declare before wiring your frontend.
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `MAGIC_LINK_URL` | yes | — | Frontend URL the emailed link points at, e.g. `https://app.example.com/auth/verify`. The token is appended as `?token=…`. |
+| `MAGIC_LINK_PATH` | no | `/auth/magic-link` | Base path the routes mount under. |
+| `MAGIC_LINK_TTL_MINUTES` | no | `30` | Link lifetime, clamped to 1–1440 minutes. |
+| `MAGIC_LINK_ALLOW_SIGNUP` | no | `true` | When `false`, unknown emails still get a `204` but no account is created and no mail is sent. |
+| `MAGIC_LINK_DEFAULT_ROLES` | no | `user` | Comma-separated roles stamped onto accounts the plugin creates. |
+
+Email delivery uses the framework mailer, so the usual `SMTP_*` env vars apply in production. In development, the link is logged to the console.
+
+### Routes
+
+<Steps>
+  <Step title="Request a link — POST /auth/magic-link/request">
+    Send `{ email, name? }`. Always responds `204` — the response never reveals whether an account exists.
+
+    ```bash
+    curl -X POST https://api.example.com/auth/magic-link/request \
+      -H 'Content-Type: application/json' \
+      -d '{ "email": "user@example.com" }'
+    # → 204 No Content
+    ```
+  </Step>
+  <Step title="Verify the token — POST /auth/magic-link/verify">
+    Send `{ token }`. The token is claimed atomically (concurrent verifies can't both win) and expiry is enforced at read time.
+
+    ```bash
+    curl -X POST https://api.example.com/auth/magic-link/verify \
+      -H 'Content-Type: application/json' \
+      -d '{ "token": "abc123..." }'
+    ```
+
+    ```json
+    {
+      "accessToken": "eyJ...",
+      "refreshToken": "eyJ...",
+      "user": { "_id": "...", "email": "user@example.com", "roles": ["user"] },
+      "purpose": "login",
+      "meta": null
+    }
+    ```
+  </Step>
+</Steps>
+
+### Invite flow
+
+The invite route (`POST /auth/magic-link/invite`) lets you carry arbitrary `meta` through a link — useful for embedding a team ID or household ID. Because `meta` is caller-supplied, the route is **refused with `403` unless your app registers an authoriser**:
+
+```js
+const magicLink = require('davepi-plugin-magic-link');
+
+magicLink.registerInviteAuthoriser(async (req, { email, meta }) => {
+  // Throw to refuse. Verify everything in `meta` belongs to the caller.
+  const household = await mongoose
+    .model('household')
+    .findOne({ _id: meta.householdId, userId: req.user.user_id })
+    .lean();
+  if (!household) throw new ForbiddenError('household not found for this account');
+
+  // Optional: bind the link to a specific existing userId.
+  return { userId: req.user.user_id };
+});
+```
+
+### Programmatic minting
+
+Use `issueMagicLink` to generate a token inside a custom flow and send the link through a different channel:
+
+```js
+const magicLink = require('davepi-plugin-magic-link');
+
+const raw = await magicLink.issueMagicLink({
+  email:   'a@b.co',
+  userId:  user._id,
+  purpose: 'invite',
+  meta:    { campaign: 'beta' },
+});
+// raw is the plain token — append it to your link URL manually
+```
+
+<Note>
+New accounts created by the magic-link flow get a cryptographically random bcrypt-hashed password the user never learns. Sign-in is by link only unless you also mount password login routes.
+</Note>
+
+  </Tab>
+  <Tab title="OAuth">
+
+## davepi-plugin-oauth
+
+`davepi-plugin-oauth` adds social sign-in for Google, GitHub, Microsoft, Apple, and Discord. It handles the full OAuth 2.0 / OIDC dance — state-HMAC CSRF defence, PKCE where the provider supports it — upserts the local User, and issues the framework's standard JWT. A provider is enabled only when both its client ID and secret are set; missing either keeps that provider's routes unmounted.
+
+### Install
+
+```bash
+npm install davepi-plugin-oauth
+```
+
+```json
+{
+  "davepi": {
+    "plugins": ["davepi-plugin-oauth"]
+  }
+}
+```
+
+### Environment variables
+
+#### Global (required when any provider is enabled)
+
+| Variable | Description |
+|----------|-------------|
+| `OAUTH_BASE_URL` | Publicly-reachable origin, e.g. `https://api.example.com`. Used to build callback URLs you register with each provider. |
+| `OAUTH_STATE_SECRET` | HMAC key for the signed `state` parameter (minimum 16 characters; 32+ recommended). |
+| `OAUTH_SUCCESS_REDIRECT` | Where to send the browser after login, e.g. `https://app.example.com/auth/success?token=`. The plugin appends the access and refresh tokens. |
+| `OAUTH_FAILURE_REDIRECT` | Where to redirect on failure. Unset returns `400` JSON instead. |
+| `OAUTH_SUCCESS_MODE` | `redirect` (default) or `handler`. In `handler` mode, register a custom success handler instead of embedding tokens in a URL. |
+| `OAUTH_DEFAULT_ROLES` | Comma-separated default roles for newly-created users. Default `user`. |
+
+#### Per provider
+
+| Variable | Provider |
+|----------|----------|
+| `OAUTH_GOOGLE_CLIENT_ID` / `_SECRET` | Enables `/auth/google` + `/auth/google/callback`. PKCE on. |
+| `OAUTH_GITHUB_CLIENT_ID` / `_SECRET` | Enables `/auth/github` + `/auth/github/callback`. |
+| `OAUTH_MICROSOFT_CLIENT_ID` / `_SECRET` | Enables `/auth/microsoft` + `/auth/microsoft/callback`. Override tenant with `OAUTH_MICROSOFT_TENANT`. |
+| `OAUTH_DISCORD_CLIENT_ID` / `_SECRET` | Enables `/auth/discord` + `/auth/discord/callback`. PKCE on. |
+| `OAUTH_APPLE_CLIENT_ID` + `_TEAM_ID` + `_KEY_ID` + `_KEY_PATH` (or `_PRIVATE_KEY`) | Enables `/auth/apple` + `/auth/apple/callback`. |
+
+Register the callback URL `{OAUTH_BASE_URL}/auth/{provider}/callback` in each provider's developer console before enabling the route.
+
+### Sign-in flow
+
+<Steps>
+  <Step title="Redirect the user to the provider">
+    Navigate the browser to `GET /auth/google` (or whichever provider). The plugin builds the provider's authorization URL, signs a `state` token, and redirects.
+  </Step>
+  <Step title="Provider redirects back">
+    The provider calls `GET /auth/google/callback?code=...&state=...`. The plugin verifies the state, exchanges the code for tokens, fetches the profile, and upserts the local User.
+  </Step>
+  <Step title="Receive the JWT">
+    The plugin issues `{ accessToken, refreshToken }` and delivers them via `OAUTH_SUCCESS_REDIRECT` or — in `handler` mode — your registered success handler.
+  </Step>
+</Steps>
+
+### Success handler mode
+
+To avoid embedding tokens in redirect URLs (they appear in server logs and browser history), set `OAUTH_SUCCESS_MODE=handler` and register a handler:
+
+```js
+const oauth = require('davepi-plugin-oauth');
+
+oauth.registerSuccessHandler(async (req, res, { tokens, user, returnTo, provider, created }) => {
+  // Issue a single-use handoff code and redirect the SPA to it.
+  const code = await mintSingleUseCode(tokens);
+  res.redirect(302, `/auth/success#code=${encodeURIComponent(code)}`);
+});
+```
+
+### Account linking
+
+Let a signed-in user attach an additional provider to their existing account:
+
+```js
+// SPA: start the link flow (SPA can't follow a 302 with Bearer auth headers)
+const { url } = await fetch('/auth/github/link', {
+  headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+}).then(r => r.json());
+location.href = url;
+```
+
+When the callback returns, the provider is linked. Subsequent sign-ins via that provider resolve to the same user.
+
+<Warning>
+Apple delivers the user's name only on the very first sign-in. The plugin captures and persists it then — Apple will not resend it on later logins.
+</Warning>
+
+  </Tab>
+  <Tab title="SMS OTP / 2FA">
+
+## davepi-plugin-twilio (auth mode)
+
+`davepi-plugin-twilio` handles both transactional SMS and authentication over SMS. For authentication, it provides SMS-based one-time passwords (OTP) for passwordless login and TOTP-based two-factor authentication (2FA). Both flows issue the same standard JWT on success.
+
+### Install
+
+```bash
+npm install davepi-plugin-twilio
+```
+
+```json
+{
+  "davepi": {
+    "plugins": ["davepi-plugin-twilio"]
+  }
+}
+```
+
+The plugin stays **dormant** until `TWILIO_ACCOUNT_SID` is set.
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `TWILIO_ACCOUNT_SID` | yes | — | Twilio account SID from the console. |
+| `TWILIO_AUTH_TOKEN` | yes | — | Twilio auth token. Also verifies inbound webhook signatures. |
+| `TWILIO_FROM_NUMBER` | yes for OTP | — | Sender number in E.164 format, e.g. `+15005550006`. |
+| `TWILIO_MESSAGING_SERVICE_SID` | no | — | Messaging Service SID. Takes precedence over `TWILIO_FROM_NUMBER` when set. |
+| `OTP_PATH` | no | `/auth/otp` | Mount path for OTP routes. Empty string disables OTP entirely. |
+| `OTP_DIGITS` | no | `6` | Number of digits in the OTP code. |
+| `OTP_TTL_SECONDS` | no | `600` | OTP validity window in seconds. |
+| `OTP_MAX_ATTEMPTS_PER_HOUR` | no | `5` | Per-phone send rate limit (rolling 1-hour window). |
+| `TOKEN_KEY` | yes for 2FA | — | Symmetric key used to encrypt TOTP secrets at rest (AES-256-GCM). Use the same key as the framework's JWT signing secret. |
+| `TWILIO_APP_NAME` | no | `APP_NAME` → `"dAvePi"` | Used as the SMS body prefix and the TOTP issuer label. |
+
+### OTP passwordless login
+
+<Steps>
+  <Step title="Send the code — POST /auth/otp">
+    ```bash
+    curl -X POST https://api.example.com/auth/otp \
+      -H 'Content-Type: application/json' \
+      -d '{ "phone": "+15555550100" }'
+    ```
+    ```json
+    { "ok": true, "expiresInSeconds": 600 }
+    ```
+    The phone number is normalised to E.164. Exceeding `OTP_MAX_ATTEMPTS_PER_HOUR` returns `403 FORBIDDEN`.
+  </Step>
+  <Step title="Verify the code — POST /auth/otp/verify">
+    ```bash
+    curl -X POST https://api.example.com/auth/otp/verify \
+      -H 'Content-Type: application/json' \
+      -d '{ "phone": "+15555550100", "code": "491823" }'
+    ```
+    ```json
+    {
+      "accessToken": "eyJ...",
+      "refreshToken": "eyJ...",
+      "user": { "_id": "...", "phone": "+15555550100", "roles": ["user"] }
+    }
+    ```
+    The code is compared with constant-time comparison and deleted after five failed attempts.
+  </Step>
+</Steps>
+
+### TOTP two-factor authentication
+
+Three routes handle 2FA enrollment and verification:
+
+```
+POST /auth/2fa/enroll     (requires Bearer JWT) → { otpauthUrl, secret, backupCodes }
+POST /auth/2fa/verify     (requires Bearer JWT) { code } → { ok: true }
+POST /auth/2fa/challenge  { userId | phone, code } → { accessToken, refreshToken, user }
+```
+
+**Enrollment** generates a TOTP secret, encrypts it with AES-256-GCM using `TOKEN_KEY`, and returns the `otpauth://` URL (render as a QR code in your UI), the raw secret for manual entry, and eight base32 backup codes. Show the backup codes once — they are stored only as SHA-256 hashes.
+
+**Challenge** accepts a fresh TOTP code or one of the backup codes. A used backup code is removed from the hash list on success.
+
+```js
+// In your /login route: detect 2FA and redirect to the challenge step
+if (user.twofaEnabled) {
+  return res.json({ twofaRequired: true, userId: user._id });
+}
+```
+
+```js
+// Programmatic verification from a custom login hook
+const twilio = require('davepi-plugin-twilio');
+const ok = await twilio.verifyTotpForUser(userId, code);
+```
+
+<Note>
+The `/login` route is owned by your app, not this plugin. Your login handler decides what to do when `user.twofaEnabled === true` — typically return a `twofaRequired` flag and have the client call `/auth/2fa/challenge` with the TOTP code.
+</Note>
+
+  </Tab>
+</Tabs>

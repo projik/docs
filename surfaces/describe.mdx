@@ -1,0 +1,173 @@
+---
+title: "Capability Manifest Endpoint — GET /_describe"
+sidebarTitle: "Describe"
+description: "GET /_describe returns a compact JSON manifest of every resource's fields, relations, aggregations, state machines, and generated tool names in one request."
+---
+
+`GET /_describe` returns a compact JSON manifest of everything dAvePi knows about your loaded schemas — fields, relations, aggregations, file fields, ACL slots, soft-delete and audit flags, REST endpoints, GraphQL queries and mutations, and MCP tool names. An agent or tool landing on a fresh dAvePi project can plan against the entire API in one round-trip, before writing a single line of integration code.
+
+## Why not Swagger?
+
+dAvePi also serves a Swagger 2.0 spec at `/api-docs/swagger.json`, but it has gaps for agent-first use:
+
+| | Swagger 2.0 | `_describe` |
+|-|-------------|-------------|
+| Size | Large — full path matrix per resource | Compact — feature flags and per-schema metadata |
+| Relations | Untyped (`accountId: string`) | First-class — `{ kind: "hasMany", target: "contact", fk: "accountId" }` |
+| State machines | Untyped enum | First-class — `{ initial, states, transitions }` |
+| Aggregations | Each is a path with hand-typed params | First-class — `[{ name, params }]` |
+| ACL slots | Absent | Present — `{ list: ["admin"] }` |
+| Idempotency support | Absent | Per-route flag |
+| MCP tools | Absent | Per-schema list |
+
+For an agent that needs to plan actions, `_describe` is the right map.
+
+---
+
+## Example response
+
+```json
+{
+  "version": "v1",
+  "features": {
+    "softDelete": true,
+    "audit": true,
+    "search": true,
+    "files": true,
+    "relations": true,
+    "aggregations": true,
+    "idempotency": true,
+    "stateMachines": true,
+    "webhooks": true
+  },
+  "schemas": [
+    {
+      "path": "account",
+      "collection": "account",
+      "softDelete": true,
+      "audit": true,
+      "fields": [
+        { "name": "userId",   "type": "String",  "required": true, "stamped": true },
+        { "name": "name",     "type": "String",  "required": true, "searchable": true },
+        { "name": "isActive", "type": "Boolean", "computed": true }
+      ],
+      "relations": {
+        "contacts": { "kind": "hasMany", "target": "contact", "fk": "accountId" }
+      },
+      "aggregations": [
+        {
+          "name": "countByRegion",
+          "params": [{ "name": "since", "type": "date" }]
+        }
+      ],
+      "stateMachines": {},
+      "fileFields": [],
+      "acl": { "list": ["admin"] },
+      "endpoints": {
+        "rest": [
+          { "method": "POST",   "path": "/api/v1/account", "idempotent": true },
+          { "method": "GET",    "path": "/api/v1/account" },
+          { "method": "GET",    "path": "/api/v1/account/:id" },
+          { "method": "PUT",    "path": "/api/v1/account/:id" },
+          { "method": "DELETE", "path": "/api/v1/account/:id" },
+          { "method": "POST",   "path": "/api/v1/account/:id/restore" }
+        ],
+        "graphql": {
+          "queries":   ["accountById", "accountMany", "accountSearch", "accountCountByRegion"],
+          "mutations": ["accountCreateOne", "accountUpdateById", "accountRemoveById", "accountRestore"]
+        },
+        "mcp": [
+          "list_account", "get_account", "create_account", "update_account",
+          "delete_account", "restore_account", "search_account",
+          "list_account_contacts", "aggregate_account_countByRegion"
+        ]
+      }
+    }
+  ],
+  "auth": {
+    "endpoints": {
+      "register": "/register",
+      "login":    "/login"
+    },
+    "tokenType": "Bearer",
+    "tokenTtl":  "2h"
+  }
+}
+```
+
+---
+
+## Who reads `_describe`
+
+<CardGroup cols={2}>
+  <Card title="AI agents" icon="robot">
+    An agent landing on a fresh project calls `/_describe` first to discover every resource, its fields, and its available tools — then plans and executes without needing hand-written context.
+  </Card>
+  <Card title="Admin SPA" icon="browser">
+    The davepi-ui admin reads `/_describe` at startup to render typed forms, relation pickers, and child tabs without hard-coding any schema knowledge.
+  </Card>
+  <Card title="gen-client" icon="code">
+    `npx davepi gen-client` walks the live schema registry directly, but a remote variant could read `/_describe` to generate a client against a deployed API.
+  </Card>
+  <Card title="Custom tooling" icon="wrench">
+    Documentation generators, custom dashboards, and third-party SDK wrappers use `/_describe` as their single source of schema truth.
+  </Card>
+</CardGroup>
+
+---
+
+## How agents use it to plan
+
+When an agent first connects to a dAvePi project, it issues one request:
+
+```http
+GET /_describe
+```
+
+From the response it learns:
+
+- Every resource name and its `path` — which becomes the basis of every MCP tool name and REST route.
+- Every field name, type, and flag (`required`, `searchable`, `computed`, `stamped`) — so it knows what to send and what the server will reject.
+- Every relation — so it can decide whether to use `include` on a `get_<path>` call or issue a separate `list_<path>_<rel>` tool call.
+- Every state machine — so it knows the valid transitions before attempting a `update_<path>` call that would be rejected.
+- Every aggregation — so it can run analytics queries without guessing the tool name or parameter shape.
+- Every MCP tool name — so it can advertise the correct tool list without calling `listTools()` first.
+
+This planning step collapses what would otherwise be multiple exploratory API calls into a single round-trip.
+
+---
+
+## Auth
+
+`/_describe` is **public by default** — it describes shape, not data. Knowing that an `account` resource exists does not expose any tenant's records; an agent still needs a valid JWT to call any generated tool or route.
+
+If you want to gate it, wrap the route with the auth middleware in `app.js`:
+
+```js
+app.use('/_describe', auth(true), describeRouter);
+```
+
+---
+
+## Stable contract
+
+The `_describe` shape is part of dAvePi's stable API contract. The framework versions it via the `version` field and treats breaking changes the same as a major-version bump. New field flags can be added in minor releases without breaking consumers; the meaning of existing keys will not change.
+
+---
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Why Agents Come First" icon="robot" href="/concepts/agent-first">
+    The design rationale — discovery before code.
+  </Card>
+  <Card title="REST API" icon="server" href="/surfaces/rest">
+    The routes that _describe enumerates.
+  </Card>
+  <Card title="MCP Server" icon="plug" href="/surfaces/mcp">
+    The MCP tool names that _describe lists per schema.
+  </Card>
+  <Card title="TypeScript Client" icon="code" href="/surfaces/client">
+    The same source of truth, enforced at compile time.
+  </Card>
+</CardGroup>

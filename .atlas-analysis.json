@@ -1,23 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "dAvePi",
+  "projectType": "framework",
+  "projectName": "dAvePi",
+  "projectDescription": "A schema-driven backend framework that auto-generates REST, GraphQL, MCP, Swagger, an admin SPA, and a typed TypeScript client from a single schema file.",
   "theme": "luma",
-  "favicon": "/favicon.svg",
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "colors": {
-    "primary": "#6366F1",
-    "light": "#EEF2FF",
-    "dark": "#312E81"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/projik/davepi"
-    }
-  },
+  "primaryColor": "#6366F1",
+  "lightColor": "#EEF2FF",
+  "darkColor": "#312E81",
   "navigation": {
     "tabs": [
       {
@@ -128,5 +116,52 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Auto-generated REST, GraphQL, MCP, Swagger, admin SPA, and typed TS client from one schema file",
+    "Built-in multi-tenant isolation that is non-bypassable",
+    "Role-based access control at document and field level",
+    "Agent-first MCP server with per-resource CRUD and aggregation tools",
+    "Hot-reload schema changes in development without restart",
+    "Plugin ecosystem: auth (magic link, OAuth), Stripe, Slack, Postmark, Twilio, search, storage, queues, Sentry",
+    "Lifecycle hooks (beforeCreate, afterCreate, beforeUpdate, afterUpdate, beforeDelete, afterDelete)",
+    "Workflow state machines for business process modeling",
+    "Outbound webhooks for real-time integrations",
+    "Declarative aggregation pipelines surfaced as REST, GraphQL, and MCP endpoints",
+    "Soft delete with optional retention and restore",
+    "Immutable audit log with before/after diffs per record",
+    "Full-text search via Typesense, Meilisearch, or Algolia",
+    "File uploads with direct-to-cloud storage (S3, R2, GCS, MinIO)",
+    "Idempotency support for safe automation and retry patterns",
+    "AI agent layer with personas, memory, skills, and per-user profiles",
+    "create-davepi-app scaffolder with CRM, ticketing, content, and b2b-saas templates"
+  ],
+  "publicApiSurface": [
+    "POST /register",
+    "POST /login",
+    "POST /api/auth/refresh",
+    "POST /api/auth/api-keys",
+    "GET /api/auth/api-keys",
+    "DELETE /api/auth/api-keys/:id",
+    "POST /api/v1/:resource",
+    "GET /api/v1/:resource",
+    "PUT /api/v1/:resource",
+    "GET /api/v1/:resource/:id",
+    "PUT /api/v1/:resource/:id",
+    "DELETE /api/v1/:resource/:id",
+    "POST /api/v1/:resource/:id/restore",
+    "GET /api/v1/:resource/:id/history",
+    "GET /api/v1/:resource/aggregations/:name",
+    "POST /api/v1/:resource/:id/:file-field",
+    "GET /api/v1/:resource/:id/:file-field",
+    "DELETE /api/v1/:resource/:id/:file-field",
+    "GET /_describe",
+    "POST /mcp (Streamable HTTP MCP transport)",
+    "GET /graphql (Apollo GraphQL endpoint)",
+    "GET /api-docs (Swagger UI)",
+    "GET /api-docs/swagger.json",
+    "npx create-davepi-app",
+    "npx davepi gen-client",
+    "npx -y @davepi/mcp (MCP stdio bridge)"
+  ]
 }

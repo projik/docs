@@ -1,0 +1,413 @@
+---
+title: "Build a Multi-Tenant Booking SaaS in 60 Minutes"
+sidebarTitle: "Bookings SaaS"
+description: "Per-tenant data isolation, Twilio SMS confirmations, Stripe checkout, and a Slack agent that takes bulk actions after you approve the list."
+---
+
+You're building Calendly-for-salons. Each salon is a tenant. Each tenant has staff, services, and appointments. Confirmations go out via SMS. Payments come in via Stripe. And — this is the key capability you're building toward — you want your Slack bot to **take actions on your behalf** after you approve them. By the end of this tutorial you'll DM your bot "send every customer with a booking tomorrow a 'looking forward to seeing you' SMS — show me the list first", approve the list in one message, and watch the bot fan out real SMS messages.
+
+## Prerequisites
+
+- Completed the [Real Estate Leads](/tutorials/real-estate-leads) tutorial or equivalent familiarity with dAvePi schemas, plugins, and the agent. You also need:
+  - Twilio sandbox credentials (`console.twilio.com`)
+  - Stripe test-mode credentials and the Stripe CLI for webhook forwarding
+  - The [common prerequisites](/tutorials/) apply throughout.
+
+---
+
+## Scaffold the project
+
+```bash
+npx create-davepi-app booking-platform --template b2b-saas
+cd booking-platform
+docker compose up -d
+npm start
+```
+
+The `b2b-saas` template ships with `account`, `member`, and `subscription` schemas that handle the multi-tenant skeleton. You'll add domain-specific schemas on top.
+
+---
+
+## Write the four schemas
+
+Create `schema/versions/v1/tenant.js`:
+
+```js
+module.exports = {
+  path: 'tenant',
+  collection: 'tenant',
+  fields: [
+    { name: 'userId', type: String, required: true },
+    { name: 'accountId', type: String, required: true },
+    { name: 'name', type: String, required: true, searchable: true, searchWeight: 5 },
+    { name: 'timezone', type: String, default: 'America/New_York' },
+    { name: 'phone', type: String },
+  ],
+};
+```
+
+Create `schema/versions/v1/staff.js`:
+
+```js
+module.exports = {
+  path: 'staff',
+  collection: 'staff',
+  fields: [
+    { name: 'userId', type: String, required: true },
+    { name: 'accountId', type: String, required: true },
+    { name: 'tenantId', type: String, required: true },
+    { name: 'name', type: String, required: true, searchable: true, searchWeight: 5 },
+    { name: 'email', type: String },
+    { name: 'role', type: String, enum: ['stylist', 'colorist', 'manager'], required: true },
+    { name: 'active', type: Boolean, default: true },
+  ],
+  relations: {
+    tenant: { belongsTo: 'tenant', localKey: 'tenantId' },
+  },
+};
+```
+
+Create `schema/versions/v1/service.js`:
+
+```js
+module.exports = {
+  path: 'service',
+  collection: 'service',
+  fields: [
+    { name: 'userId', type: String, required: true },
+    { name: 'accountId', type: String, required: true },
+    { name: 'tenantId', type: String, required: true },
+    { name: 'name', type: String, required: true, searchable: true, searchWeight: 5 },
+    { name: 'duration_minutes', type: Number, required: true },
+    { name: 'price_cents', type: Number, required: true },
+    { name: 'description', type: String, searchable: true },
+  ],
+  relations: {
+    tenant: { belongsTo: 'tenant', localKey: 'tenantId' },
+  },
+};
+```
+
+Create `schema/versions/v1/appointment.js`:
+
+```js
+module.exports = {
+  path: 'appointment',
+  collection: 'appointment',
+  fields: [
+    { name: 'userId', type: String, required: true },
+    { name: 'accountId', type: String, required: true },
+    { name: 'tenantId', type: String, required: true },
+    { name: 'staffId', type: String, required: true },
+    { name: 'serviceId', type: String, required: true },
+    { name: 'customer_name', type: String, required: true, searchable: true },
+    { name: 'customer_email', type: String },
+    { name: 'customer_phone', type: String, required: true },
+    { name: 'scheduled_at', type: Date, required: true },
+    { name: 'duration_minutes', type: Number, required: true },
+    {
+      name: 'status',
+      type: String,
+      enum: ['booked', 'reminded', 'completed', 'no_show', 'cancelled'],
+      default: 'booked',
+    },
+    {
+      name: 'payment_status',
+      type: String,
+      enum: ['unpaid', 'paid', 'refunded'],
+      default: 'unpaid',
+    },
+    { name: 'stripe_session_id', type: String },
+    { name: 'notes', type: String },
+  ],
+  relations: {
+    tenant: { belongsTo: 'tenant', localKey: 'tenantId' },
+    staff: { belongsTo: 'staff', localKey: 'staffId' },
+    service: { belongsTo: 'service', localKey: 'serviceId' },
+  },
+  aggregations: [
+    {
+      name: 'utilisationByDay',
+      description: 'Appointment count by tenant, per day, for capacity reporting.',
+      pipeline: [
+        {
+          $group: {
+            _id: {
+              tenantId: '$tenantId',
+              y: { $year: '$scheduled_at' },
+              m: { $month: '$scheduled_at' },
+              d: { $dayOfMonth: '$scheduled_at' },
+            },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { '_id.y': 1, '_id.m': 1, '_id.d': 1 } },
+      ],
+      cache: { ttlSeconds: 60 },
+    },
+  ],
+};
+```
+
+Hot reload picks all four up. Every read in dAvePi is automatically scoped by `userId` **and** `accountId` — a user from Tenant A querying `/api/v1/appointment` never sees Tenant B's rows. See [Tenant isolation](/concepts/tenancy/).
+
+---
+
+## Seed two salons
+
+Register a user (you, the platform operator). Through the admin UI, create two tenants — "Salon A" and "Salon B" — and add 3 staff + 4 services + 6 appointments per tenant. For Salon A's appointments, set 4 of them to `scheduled_at: tomorrow` so the SMS demo at the end hits real data. Use real phone numbers for at least two appointments per tenant (your own and a friend's), or use the Twilio sandbox's verified numbers list.
+
+---
+
+## Install the Twilio plugin
+
+```bash
+npm install davepi-plugin-twilio
+```
+
+Add to `package.json`:
+
+```json
+{
+  "davepi": {
+    "plugins": [
+      "davepi-plugin-twilio"
+    ]
+  }
+}
+```
+
+Add to `.env`:
+
+```bash
+TWILIO_ACCOUNT_SID=AC...
+TWILIO_AUTH_TOKEN=...
+TWILIO_FROM_NUMBER=+15005550006   # Twilio sandbox magic number
+```
+
+Restart the server. The plugin loads dormant if `TWILIO_ACCOUNT_SID` is missing; it activates once you set it.
+
+### Wire SMS confirmations
+
+Open Claude Code and ask:
+
+> Add an `afterCreate` hook to appointment that uses the Twilio plugin's `sendSms` to text the customer a confirmation with the service name, time, and a reschedule link. Best-effort — if Twilio is down, log and continue.
+
+Claude adds the hook. After-hooks are best-effort: the response isn't held on plugin failure.
+
+### Wire reminder cron
+
+```bash
+npm install davepi-plugin-cron
+```
+
+Add `davepi-plugin-cron` to the plugins array in `package.json` and add the cron schedule:
+
+```json
+{
+  "davepi": {
+    "plugins": [
+      "davepi-plugin-cron",
+      "davepi-plugin-twilio"
+    ],
+    "cron": {
+      "appointmentReminders": {
+        "schedule": "*/15 * * * *",
+        "handler": "./plugins/appointment-reminders.js"
+      }
+    }
+  }
+}
+```
+
+Ask Claude:
+
+> Add a cron handler at `plugins/appointment-reminders.js` that finds appointments scheduled within the next 24 hours still in status `booked`, sends a Twilio SMS reminder for each, and flips `status` to `reminded`.
+
+Claude creates the file. The cron plugin handles distributed locking so multiple dynos don't double-send.
+
+---
+
+## Install the Stripe plugin
+
+```bash
+npm install davepi-plugin-stripe
+```
+
+Add `davepi-plugin-stripe` to the plugins array. Add to `.env`:
+
+```bash
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+STRIPE_WEBHOOK_PATH=/api/webhooks/stripe
+```
+
+Ask Claude:
+
+> Add a custom route `POST /api/checkout/appointment/:id` that creates a Stripe checkout session for that appointment's `service.price_cents`, stores the session id back on the appointment row, and returns the checkout URL. Hook the Stripe webhook so on `checkout.session.completed`, the appointment's `payment_status` flips to `paid`. Refuse the route for client-authed callers.
+
+Restart the server. Test with the Stripe CLI:
+
+```bash
+stripe listen --forward-to localhost:5050/api/webhooks/stripe
+```
+
+Create an appointment through the UI, copy its id, then:
+
+```bash
+curl -X POST http://localhost:5050/api/checkout/appointment/$APT_ID \
+  -H "Authorization: Bearer $TOKEN"
+# → { "url": "https://checkout.stripe.com/c/pay/cs_test_..." }
+```
+
+Pay with the Stripe test card `4242 4242 4242 4242`. The webhook fires and the appointment's `payment_status` flips to `paid`. The audit plugin (auto-loaded by the `b2b-saas` template) records the change.
+
+---
+
+## Wire the agent in per-user mode
+
+Previous tutorials used service-account auth — one bearer for the whole bot. Multi-tenant bookings require **per-user** auth: each Slack user maps to a real dAvePi user, so their JWT scopes reads to their own tenant automatically.
+
+```bash
+npm install @davepi/agent
+```
+
+Create `.env.agent`:
+
+```bash
+DAVEPI_URL=http://localhost:5050
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Per-user mode
+AGENT_AUTH_MODE=per-user
+AGENT_LINK_BASE_URL=http://localhost:5060
+STORE_URL=file:./davepi-agent-store.json
+AGENT_SESSION_SECRET=$(openssl rand -hex 32)
+
+# With 4 resources × ~7 tools each plus aggregations and relations,
+# you're past the default 40-tool limit. Set it higher.
+AGENT_TOOL_LIMIT=80
+
+# Slack
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_SIGNING_SECRET=...
+SLACK_SOCKET_MODE=true
+SLACK_APP_TOKEN=xapp-...
+```
+
+Register two dAvePi users — one for each salon's manager. In the admin UI, set their `accountId` to point at their respective salon's tenant.
+
+Start the agent:
+
+```bash
+set -a; source .env; source .env.agent; set +a
+npx davepi-agent
+```
+
+---
+
+## Link your Slack identity
+
+DM the bot:
+
+```
+Hi
+```
+
+The bot replies with a one-time link:
+
+> *"You need to link your account first. Open this and sign in: http://localhost:5060/link/&lt;nonce&gt;"*
+
+Click the link, enter your salon manager's email and password. The agent calls dAvePi's `POST /login` server-side, stores the refresh token locally, and shows a "Linked." confirmation. The browser **never** sees the refresh token — credentials POST server-side, token stored server-side. Have a colleague link to the other salon's manager account.
+
+---
+
+## Three Slack moments
+
+<Steps>
+  <Step title="Read-only tenant-scoped query">
+    Salon A's manager DMs:
+
+    ```
+    How many appointments are booked for tomorrow at my salon?
+    ```
+
+    The agent calls `list_appointment` with a `scheduled_at` filter for tomorrow. Because the JWT scopes to Tenant A's `accountId`, the result contains only Tenant A's rows — the agent doesn't know Tenant B exists. The bot replies with a count and breakdown by staff.
+
+    Have the other user ask the same question. Different answer, different rows. Same code, no per-tenant branching anywhere.
+  </Step>
+  <Step title="Double-booking detection">
+    ```
+    Which staff at my salon are double-booked next week? Show me a table with the conflicts.
+    ```
+
+    The agent calls `list_appointment` filtered to the next seven days, sorted by `staffId` + `scheduled_at`. It detects overlapping windows per staff member in-process and renders a Block Kit table with the conflicts.
+  </Step>
+  <Step title="Bulk action with approval gate">
+    ```
+    Send every customer with a booking tomorrow a "looking forward to seeing you" SMS.
+    Wait — show me the list first so I can approve.
+    ```
+
+    The agent:
+    1. Calls `list_appointment` filtered to tomorrow + `status: booked`.
+    2. Calls `render_table` with `customer_name`, time, service, and masked phone number.
+    3. Replies: *"Here are the 14 appointments. Reply with `confirm` to send the SMS to all, or list names to skip."*
+
+    You type `confirm`. The agent calls the Twilio plugin's `sendSms` tool once per row. The audit plugin records every action — timestamp, your user id, and the payload. The bot reports: *"Sent 13, 1 number invalid: Marcus K."*
+  </Step>
+</Steps>
+
+<Warning>
+  The bulk action pattern requires explicit human approval before any SMS sends. Never configure the agent to act on bulk operations without an intermediate confirmation step — the `render_table` → `confirm` flow shown here is the right shape.
+</Warning>
+
+---
+
+## Inspect the audit trail
+
+Open the admin UI's `audit` resource and filter to recent rows:
+
+- The bulk SMS produced 13 rows, all tagged with your `userId` and `accountId`.
+- The `before`/`after` columns on appointment updates show what changed (e.g. `payment_status: unpaid → paid` for the Stripe ones).
+- A field-level redaction policy (`AUDIT_REDACT=password,token,secret`) means card details from the Stripe webhook never appear in audit rows.
+
+Ask the bot:
+
+```
+Show me a table of every SMS we sent in the last hour from the audit log.
+```
+
+The agent calls `list_audit` (an admin-only resource), filters to `action: 'plugin.twilio.sendSms'`, and renders the table.
+
+---
+
+## What you built
+
+<CardGroup cols={2}>
+  <Card title="Multi-tenant isolation" icon="building">
+    Four resources with automatic per-tenant scoping via `accountId`. Tenant A's manager never sees Tenant B's data — no per-tenant branching in any code.
+  </Card>
+  <Card title="Twilio SMS pipeline" icon="message">
+    Confirmation hook on `afterCreate`, a 15-minute cron for reminders with distributed locking, and a bot that fans out bulk SMS after explicit human approval.
+  </Card>
+  <Card title="Stripe checkout" icon="credit-card">
+    A custom checkout route + webhook handler that flips `payment_status` on `checkout.session.completed`. All wired by Claude.
+  </Card>
+  <Card title="Per-user agent auth" icon="user-lock">
+    Each Slack user links to a real dAvePi user via a refresh-token link flow. The bot's answers are scoped by that user's JWT, not by a shared service account.
+  </Card>
+</CardGroup>
+
+You wrote ~120 lines of schema. You wrote zero lines of Twilio SDK code, zero lines of Stripe webhook plumbing, zero lines of tenant-scoping logic, and zero lines of audit-write code.
+
+---
+
+## What to read next
+
+- **[Internal IT Helpdesk](/tutorials/internal-it-helpdesk)** — the agent reaches beyond dAvePi with web search, custom MCP tools, and a confused-deputy guard.
+- [Concepts → Tenant isolation](/concepts/tenancy/) — the model behind automatic scoping.
+- [Surfaces → Agent → Auth modes](/agents/overview) — service vs per-user, when to pick each, and the link-flow shape.
+- [Features → Audit](/features/audit/) — what's captured, where it's stored, retention.
+- [`davepi-plugin-twilio`](https://github.com/projik/davepi/tree/main/packages/davepi-plugin-twilio), [`davepi-plugin-stripe`](https://github.com/projik/davepi/tree/main/packages/davepi-plugin-stripe), [`davepi-plugin-cron`](https://github.com/projik/davepi/tree/main/packages/davepi-plugin-cron)

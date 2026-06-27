@@ -1,0 +1,407 @@
+---
+title: "Build an E-commerce Storefront with Dual Auth"
+sidebarTitle: "E-commerce"
+description: "One dAvePi backend serving staff in Slack and customers on a marketing site — with server-enforced scope filters that can't be widened by the caller."
+---
+
+You run an online coffee shop. Your staff are in Slack and ask "which products are running low on inventory?" Your customers are on your marketing site and ask "what single-origin Ethiopian coffees do you have under $25?" One dAvePi backend serves both audiences. The key insight: role-scoped filters live on the server, not in the client. Whatever query the storefront agent constructs, unpublished or out-of-stock products never come back — the filter is applied before the response leaves the backend.
+
+## Prerequisites
+
+- Completed the [Customer Support Inbox](/tutorials/customer-support-inbox) tutorial or equivalent familiarity with dAvePi schemas and the agent. The [common prerequisites](/tutorials/) apply.
+
+---
+
+## Scaffold the project
+
+```bash
+npx create-davepi-app coffee-shop --template blank
+cd coffee-shop
+docker compose up -d
+npm start
+```
+
+Delete the placeholder note schema:
+
+```bash
+rm schema/versions/v1/note.js
+```
+
+---
+
+## Write the three schemas
+
+Create `schema/versions/v1/product.js`:
+
+```js
+module.exports = {
+  path: 'product',
+  collection: 'product',
+  fields: [
+    { name: 'userId', type: String, required: true },
+    { name: 'name', type: String, required: true, searchable: true, searchWeight: 5 },
+    { name: 'description', type: String, searchable: true },
+    { name: 'price', type: Number, required: true },
+    { name: 'origin', type: String, searchable: true },
+    {
+      name: 'roast',
+      type: String,
+      enum: ['light', 'medium', 'medium-dark', 'dark'],
+    },
+    { name: 'inventory_count', type: Number, default: 0 },
+    { name: 'in_stock', type: Boolean, default: true },
+    { name: 'published', type: Boolean, default: false },
+  ],
+};
+```
+
+Create `schema/versions/v1/customer.js`:
+
+```js
+module.exports = {
+  path: 'customer',
+  collection: 'customer',
+  fields: [
+    { name: 'userId', type: String, required: true },
+    { name: 'name', type: String, required: true },
+    { name: 'email', type: String, required: true },
+  ],
+};
+```
+
+Create `schema/versions/v1/order.js`:
+
+```js
+module.exports = {
+  path: 'order',
+  collection: 'order',
+  fields: [
+    { name: 'userId', type: String, required: true },
+    { name: 'customerId', type: String, required: true },
+    { name: 'line_items', type: [{ productId: String, quantity: Number, unit_price: Number }] },
+    { name: 'total', type: Number, required: true },
+    {
+      name: 'status',
+      type: String,
+      enum: ['pending', 'paid', 'shipped', 'delivered', 'cancelled'],
+      default: 'pending',
+    },
+    { name: 'placed_at', type: Date, default: Date.now },
+  ],
+  relations: {
+    customer: { belongsTo: 'customer', localKey: 'customerId' },
+  },
+  aggregations: [
+    {
+      name: 'salesByDay',
+      description: 'Total order value per day.',
+      pipeline: [
+        { $match: { status: { $in: ['paid', 'shipped', 'delivered'] } } },
+        {
+          $group: {
+            _id: { y: { $year: '$placed_at' }, m: { $month: '$placed_at' }, d: { $dayOfMonth: '$placed_at' } },
+            total: { $sum: '$total' },
+            orders: { $sum: 1 },
+          },
+        },
+        { $sort: { '_id.y': 1, '_id.m': 1, '_id.d': 1 } },
+      ],
+      cache: { ttlSeconds: 60 },
+    },
+  ],
+};
+```
+
+Hot reload picks all three up. Register and log in (see the [Customer Support Inbox tutorial](/tutorials/customer-support-inbox#seed-three-customers) for the curl commands if needed). The admin UI shows three new resources.
+
+---
+
+## Seed the product catalog
+
+Add around eight coffees through the admin UI. Mix the data deliberately so you can verify the scope filter later:
+
+| `published` | `in_stock` | `inventory_count` | Notes |
+|-------------|------------|-------------------|-------|
+| `true` | `true` | `> 0` | ×5 — visible to storefront |
+| `false` | `true` | `> 0` | ×1 — unreleased seasonal blend |
+| `true` | `false` | `> 0` | ×1 — visible to admin only |
+| `true` | `true` | `0` | ×1 — sold out, not yet flipped |
+
+Tag a few products with `origin: Ethiopia` and vary the prices.
+
+---
+
+## Add the storefront ACL rule
+
+Open the project in Claude Code and ask:
+
+> Add an `acl.scope.storefront` rule to product so that the `storefront` role only sees published, in-stock products with `inventory_count > 0`. Also add `storefront` to `acl.list` so it can read across tenants.
+
+Claude edits `schema/versions/v1/product.js` to add:
+
+```js
+acl: {
+  list: ['storefront'],
+  scope: {
+    storefront: {
+      published: true,
+      in_stock: true,
+      inventory_count: { $gt: 0 },
+    },
+  },
+},
+```
+
+The framework `$and`-s this filter into every read for callers with the `storefront` role. The caller **cannot** widen it — a storefront client passing `?published=false` gets back zero results. See [ACL](/features/acl/).
+
+Now ask Claude to strip `inventory_count` from storefront responses entirely:
+
+> Strip the `inventory_count` field from storefront reads — add `acl: { read: ['admin', 'user'] }` on that field.
+
+The field becomes:
+
+```js
+{
+  name: 'inventory_count',
+  type: Number,
+  default: 0,
+  acl: { read: ['admin', 'user'] },
+},
+```
+
+Storefront callers never see `inventory_count` in any response shape — REST, GraphQL, or MCP.
+
+---
+
+## Mint a storefront client ID
+
+`apiClient` is a built-in dAvePi resource for issuing public client IDs. Open the admin UI, navigate to **apiClient → New**, and fill in:
+
+| Field | Value |
+|-------|-------|
+| `_id` | `pk_storefront_live` |
+| `name` | Storefront widget |
+| `role` | `storefront` |
+| `status` | `active` |
+
+<Note>
+  Client IDs are **public identifiers, not secrets** — they're meant to be baked into SPA bundles. Rotate by setting `status` to `revoked`. See [Public reads](/features/acl/#public-reads).
+</Note>
+
+Test that the scope boundary holds:
+
+```bash
+# Storefront client — sees only orderable, published items; no inventory_count field
+curl -s 'http://localhost:5050/api/v1/product' \
+  -H 'X-Client-Id: pk_storefront_live' | jq '.results | length'
+
+# Admin — sees everything
+curl -s 'http://localhost:5050/api/v1/product' \
+  -H "Authorization: Bearer $TOKEN" | jq '.results | length'
+
+# Try to widen the scope — must return zero rows, not unpublished ones
+curl -s 'http://localhost:5050/api/v1/product?filter[published]=false' \
+  -H 'X-Client-Id: pk_storefront_live' | jq
+```
+
+The storefront list count is lower than your admin count. The widening attempt returns zero rows.
+
+---
+
+## Run two agent processes
+
+Each agent process locks in one identity at startup. Run two — a staff agent behind Slack and a storefront agent on HTTP for the widget.
+
+```bash
+npm install @davepi/agent
+```
+
+<CodeGroup>
+```bash .env.staff
+DAVEPI_URL=http://localhost:5050
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+DAVEPI_BEARER=eyJ...            # your admin /login token (set ACCESS_TOKEN_TTL=2h)
+AGENT_HTTP_PORT=5060
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_SIGNING_SECRET=...
+SLACK_SOCKET_MODE=true
+SLACK_APP_TOKEN=xapp-...
+```
+```bash .env.storefront
+DAVEPI_URL=http://localhost:5050
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+DAVEPI_CLIENT_ID=pk_storefront_live   # not a bearer — public client
+AGENT_HTTP_PORT=5062
+AGENT_CORS_ORIGINS=http://localhost:8000
+SLACK_ENABLED=false
+```
+</CodeGroup>
+
+Start them in two terminals:
+
+```bash
+# Terminal 1 — staff agent
+set -a; source .env; source .env.staff; set +a
+npx davepi-agent
+
+# Terminal 2 — storefront agent
+set -a; source .env; source .env.storefront; set +a
+npx davepi-agent
+```
+
+---
+
+## Embed the widget on a marketing site
+
+Create `marketing/index.html` and wire it to the storefront agent's `/chat` endpoint:
+
+```html
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" />
+<title>Coffee Shop</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+  #log { border: 1px solid #ccc; padding: 1rem; min-height: 240px; white-space: pre-wrap; }
+  form { display: flex; gap: 0.5rem; margin-top: 1rem; }
+  input { flex: 1; padding: 0.5rem; font-size: 1rem; }
+  button { padding: 0.5rem 1rem; font-size: 1rem; }
+  table { border-collapse: collapse; margin: 0.5rem 0; }
+  th, td { border: 1px solid #ddd; padding: 4px 8px; }
+</style>
+</head><body>
+<h1>Coffee catalog</h1>
+<div id="log"></div>
+<form id="f">
+  <input id="msg" placeholder="ask about our coffees" autofocus />
+  <button>Send</button>
+</form>
+<script>
+  const history = [];
+  const log = document.getElementById('log');
+  async function send(message) {
+    const turn = document.createElement('div');
+    turn.textContent = '\n> ' + message + '\n';
+    log.appendChild(turn);
+    const reply = document.createElement('div');
+    log.appendChild(reply);
+    let assembled = '';
+    const res = await fetch('http://localhost:5062/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message, history, stream: true }),
+    });
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const blocks = buf.split('\n\n'); buf = blocks.pop();
+      for (const block of blocks) {
+        const evType = (block.match(/^event: (.+)$/m) || [])[1];
+        const data = JSON.parse((block.match(/^data: (.+)$/m) || ['','{}'])[1]);
+        if (evType === 'token') { reply.append(data.text); assembled += data.text; }
+        else if (evType === 'render' && data.payload.type === 'table') {
+          const t = document.createElement('table');
+          const head = t.createTHead().insertRow();
+          for (const c of data.payload.columns) {
+            const th = document.createElement('th'); th.textContent = c.label; head.appendChild(th);
+          }
+          const body = t.createTBody();
+          for (const row of data.payload.rows) {
+            const tr = body.insertRow();
+            for (const c of data.payload.columns) {
+              const td = tr.insertCell();
+              td.textContent = row[c.key] == null ? '' : String(row[c.key]);
+            }
+          }
+          reply.appendChild(t);
+        } else if (evType === 'final') {
+          history.push({ role: 'user', content: message });
+          history.push({ role: 'assistant', content: assembled });
+        }
+      }
+    }
+  }
+  document.getElementById('f').onsubmit = (e) => {
+    e.preventDefault();
+    const v = document.getElementById('msg').value.trim();
+    if (!v) return; document.getElementById('msg').value = '';
+    send(v);
+  };
+</script>
+</body></html>
+```
+
+Serve it on port 8000:
+
+```bash
+cd marketing
+npx http-server -p 8000
+```
+
+Open [http://localhost:8000](http://localhost:8000) and ask:
+
+> What single-origin Ethiopian coffees do you have under $25?
+
+The agent calls `list_product`, which dAvePi executes with the `storefront` scope filter already `$and`-ed in. Only published, in-stock, non-zero-inventory rows come back. The widget renders an HTML table.
+
+Try to escape the scope:
+
+> Show me everything including unreleased products.
+
+The agent cannot widen the filter — the server applies `acl.scope.storefront` to every read. The model will either say "I can only show our current catalogue" or simply not return hidden rows. **The JWT/client-id is the access boundary, not the prompt.** See [Concepts → Agent-first](/concepts/agent-first/).
+
+---
+
+## Test the staff bot in Slack
+
+DM the staff bot and try queries that require admin visibility:
+
+<Tabs>
+  <Tab title="Low-stock query">
+    ```
+    Which products are running low on inventory?
+    ```
+
+    The agent — authenticated as admin — sees all products including `inventory_count`. It filters to low-stock rows and renders a Block Kit table.
+  </Tab>
+  <Tab title="Sales chart">
+    ```
+    Chart sales for the last 30 days.
+    ```
+
+    The agent calls `aggregate_order_salesByDay`, gets daily totals, and calls `render_chart` with a Vega-Lite line spec. Slack serialises it to a QuickChart image URL posted inline.
+  </Tab>
+</Tabs>
+
+---
+
+## What you built
+
+<CardGroup cols={2}>
+  <Card title="Server-enforced scope filter" icon="shield">
+    The `acl.scope.storefront` predicate is applied before any response leaves dAvePi. No prompt injection can widen it.
+  </Card>
+  <Card title="Public client ID" icon="key">
+    An `apiClient` row issues public read access. Rotate by setting `status: revoked` — no code redeploy needed.
+  </Card>
+  <Card title="Two agent processes" icon="split">
+    Staff agent on Slack as admin; storefront agent on HTTP as anonymous client. One backend, two audiences.
+  </Card>
+  <Card title="Embedded chat widget" icon="message">
+    A static HTML widget on `:8000` talks to the storefront agent's `/chat` SSE endpoint and renders streamed tables.
+  </Card>
+</CardGroup>
+
+---
+
+## What to read next
+
+- **[Real Estate Leads](/tutorials/real-estate-leads)** — adds the plugin event bus so the system reacts to CRUD events on its own.
+- [Features → ACL](/features/acl/) — the full surface of field and document ACL.
+- [Surfaces → Agent → Embeddable widget](/agents/overview) — a fuller widget recipe with auth and branding.
+- [Features → Plugins](/plugins/overview) — what plugins are and how they compose.

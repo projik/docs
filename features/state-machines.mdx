@@ -1,0 +1,217 @@
+---
+title: "Workflow State Machines on Schema Fields"
+sidebarTitle: "State Machines"
+description: "Declare a finite-state transition graph on any String field and let the framework enforce valid moves, stamp initial state, and expose available transitions."
+---
+
+A state-machine field is a `String` field with an extra `stateMachine` config block. The framework stamps the initial state at create time, validates every subsequent change against your declared transitions, rejects invalid moves with a structured error, runs `onEnter` side effects, and attaches `availableTransitions` to every read response so your UI can render the right action buttons without parsing the schema itself.
+
+## Declaring a state machine
+
+Add `stateMachine` to any `String` field in your schema:
+
+```js
+module.exports = {
+  path: 'deal',
+  fields: [
+    { name: 'userId',    type: String, required: true },
+    { name: 'accountId', type: String, required: true },
+    { name: 'title',     type: String, required: true },
+    { name: 'stage',     type: String,
+      stateMachine: {
+        initial: 'prospecting',
+        states: ['prospecting', 'qualified', 'proposal', 'won', 'lost'],
+        transitions: {
+          prospecting: ['qualified', 'lost'],
+          qualified:   ['proposal', 'lost'],
+          proposal:    ['won', 'lost'],
+        },
+        onEnter: {
+          won: async (record, ctx) => {
+            await ctx.events.emit('deal.won', { id: record._id });
+          },
+          lost: async (record, ctx) => {
+            ctx.log.info({ dealId: record._id }, 'deal marked lost');
+          },
+        },
+      },
+    },
+  ],
+};
+```
+
+| Sub-key | Required | Description |
+|---------|----------|-------------|
+| `initial` | ✅ | Stamped server-side on `POST`. Clients cannot pick a non-initial state on create. |
+| `states` | ✅ | All valid states. Becomes a literal type union in the typed client. |
+| `transitions` | ✅ | Map of `currentState → allowedNextStates[]`. Terminal states (like `won` and `lost`) simply have no entry. |
+| `onEnter` | ❌ | Map of `state → async (record, ctx)`. Runs once per arrival. Errors are logged and never fail the mutation. |
+
+## What the framework enforces
+
+<Steps>
+  <Step title="Stamp initial state on create">
+    When you `POST` a new record, the framework sets the state-machine field to `initial` server-side. Any value the client sends for that field is ignored.
+  </Step>
+  <Step title="Validate every transition">
+    On every `PUT`, GraphQL update mutation, or MCP update, the framework checks whether the new value is listed in `transitions[currentState]`. If it isn't, the request is rejected with `422 INVALID_TRANSITION` before any write occurs.
+  </Step>
+  <Step title="Run onEnter side effects">
+    After a successful transition, the framework calls `onEnter[newState]` if you declared one. These are best-effort — errors are logged but never fail the response.
+  </Step>
+  <Step title="Attach availableTransitions to every read">
+    Every `GET` response includes an `availableTransitions` object keyed by field name, so clients can determine which transitions are valid without parsing the schema.
+  </Step>
+</Steps>
+
+## Invalid transition error shape
+
+When you attempt a disallowed move, the framework returns:
+
+```json
+{
+  "error": {
+    "code": "INVALID_TRANSITION",
+    "message": "Cannot transition stage from 'proposal' to 'prospecting'",
+    "details": {
+      "field":     "stage",
+      "current":   "proposal",
+      "attempted": "prospecting",
+      "allowed":   ["won", "lost"]
+    }
+  }
+}
+```
+
+Agents that read `details.allowed` can self-correct without re-reading the schema.
+
+## Driving transitions across surfaces
+
+<Tabs>
+  <Tab title="REST">
+    Send the new state value through the standard `PUT /:id` route. There is no separate action endpoint:
+
+    ```http
+    PUT /api/v1/deal/abc
+    Authorization: Bearer <token>
+    Content-Type: application/json
+
+    { "stage": "qualified" }
+    ```
+
+    The framework validates the move against `transitions[currentStage]` before persisting.
+  </Tab>
+  <Tab title="GraphQL">
+    A dedicated `<path>Transition<Field>(_id, to)` mutation is generated for each state-machine field. The `to` argument is typed as the schema's generated enum:
+
+    ```graphql
+    mutation {
+      dealTransitionStage(_id: "abc", to: qualified) {
+        record {
+          _id
+          stage
+          availableTransitions { stage }
+        }
+      }
+    }
+    ```
+
+    The standard `dealUpdateById` resolver also validates against the state machine when the field is set, but the dedicated mutation is preferred.
+  </Tab>
+  <Tab title="MCP">
+    Send the new value through `update_<path>` — the same validation runs:
+
+    ```json
+    {
+      "name": "update_deal",
+      "arguments": {
+        "id": "abc",
+        "record": { "stage": "qualified" }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Typed client">
+    Use the generated per-field transition method. The compiler catches typos because the argument is typed as a literal union:
+
+    ```ts
+    await api.deal.transitionStage(id, 'qualified');
+    //                                  ^^^^^^^^^^^
+    // Typed as 'prospecting' | 'qualified' | 'proposal' | 'won' | 'lost'
+    ```
+  </Tab>
+</Tabs>
+
+## availableTransitions on every read
+
+Every read response includes a virtual `availableTransitions` object:
+
+```json
+{
+  "_id": "abc",
+  "title": "Acme deal",
+  "stage": "qualified",
+  "availableTransitions": {
+    "stage": ["proposal", "lost"]
+  }
+}
+```
+
+When a schema has multiple state-machine fields, each gets its own key in the object:
+
+```json
+{
+  "availableTransitions": {
+    "editorialStatus":  ["review"],
+    "fulfillmentStatus": ["shipped", "cancelled"]
+  }
+}
+```
+
+## onEnter hooks
+
+`onEnter` hooks receive `(record, ctx)` where `ctx` carries `{ user, log, events, models, schema }`:
+
+```js
+onEnter: {
+  won: async (record, ctx) => {
+    await ctx.events.emit('deal.won', { id: record._id });
+    await sendWonNotification(record);
+  },
+  lost: async (record, ctx) => {
+    ctx.log.info({ dealId: record._id }, 'deal marked lost');
+  },
+},
+```
+
+<Note>
+  `onEnter` errors are logged but never fail the mutation — the same posture as audit and `after*` lifecycle hooks. If the side effect must succeed before the transition is acknowledged, do the work in a custom route that wraps the transition.
+</Note>
+
+## Multiple state machines on one schema
+
+Each state-machine field operates independently. Declare as many as you need:
+
+```js
+fields: [
+  { name: 'editorialStatus',  type: String, stateMachine: { /* ... */ } },
+  { name: 'fulfillmentStatus', type: String, stateMachine: { /* ... */ } },
+],
+```
+
+Each gets its own:
+- `dealTransitionEditorialStatus` / `dealTransitionFulfillmentStatus` GraphQL mutations
+- `transitionEditorialStatus` / `transitionFulfillmentStatus` typed client methods
+- Slot in `availableTransitions`
+
+## Audit and webhooks
+
+Every successful transition writes an audit row with `action: 'transition'`, the old and new state, the actor's `userId`, and the field name. It also emits a `<path>.transitioned` event in addition to the regular `<path>.updated` event — your webhook subscriptions can filter on `deal.transitioned` to react specifically to stage changes.
+
+## See also
+
+- [Field options](/reference/fields#state-machine) — full declaration reference.
+- [Hooks](/features/hooks) — `beforeUpdate` / `afterUpdate` fire on REST `PUT /:id` transitions.
+- [Audit log](/features/audit) — each transition writes a dedicated row.
+- [Webhooks](/features/webhooks) — subscribe to `<path>.transitioned` events.
+- [Errors](/reference/errors) — full `INVALID_TRANSITION` payload reference.

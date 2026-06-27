@@ -1,0 +1,158 @@
+---
+title: "Role-Based Access Control in dAvePi Schemas"
+sidebarTitle: "Access Control"
+description: "Control who can list, write, delete, and read individual fields by declaring ACL roles on your schema and field definitions."
+---
+
+Every schema starts owner-only: dAvePi scopes every read and write to the `userId` from the caller's JWT. ACL lets you open specific operations to additional roles — for example, letting an `admin` role list records across all tenants, or restricting a `salary` field to `hr` and `admin` only. You opt in one slot at a time; everything you don't declare stays owner-only.
+
+Roles arrive in the JWT's `roles` claim. A missing or empty `roles` array falls back to `['user']`. Issuing roles is your responsibility — attach them in your custom registration or admin-promotion logic.
+
+## Document-level ACL
+
+Add an `acl` block to your schema's top-level export and name the operations you want to open up:
+
+```js
+module.exports = {
+  path: 'order',
+  fields: [/* ... */],
+  acl: {
+    list:   ['admin', 'support'], // bypass userId scope on list/find/count
+    delete: ['admin'],            // delete records they don't own
+    write:  ['admin'],            // update records they don't own
+  },
+};
+```
+
+<Note>
+  There is no `create` slot at the document level. Creates always stamp `userId` and `accountId` from the caller's JWT, so every record is born owned by its creator.
+</Note>
+
+The three slots map to specific operations:
+
+| Slot | Bypasses |
+|------|---------|
+| `list` | `GET /api/v1/<path>` list, `findMany` / `findOne` / `count` resolvers, `list_<path>` MCP tool, full-text search, audit-log history, aggregations. |
+| `delete` | `DELETE /api/v1/<path>/:id`, `<path>RemoveById` GraphQL mutation, `delete_<path>` MCP tool. Soft-delete restore inherits this slot. |
+| `write` | `PUT /api/v1/<path>/:id`, `<path>UpdateById` / `<path>UpdateOne` / `<path>UpdateMany` GraphQL mutations, state-machine transition mutations, `update_<path>` MCP tool. |
+
+A `write`-bypass role widens **which** records a role may update, never **who** ends up owning them. Tenant fields (`userId`, `accountId`) are stripped from every update payload before persistence, so ownership cannot be transferred through ACL bypass. Field-level `update` ACL still applies on top — a `write`-bypass role that lacks a field's `acl.update` still cannot touch that field.
+
+<Warning>
+  The bulk `PUT /api/v1/<path>` upsert deliberately stays owner-only even for `write`-bypass roles. Its query predicate doubles as the insert seed, and a bypass there could mint ownerless documents. Use the by-id `PUT /:id` or GraphQL `UpdateMany` instead.
+</Warning>
+
+## Field-level ACL
+
+Declare `acl` on any field to gate read access or write access separately:
+
+```js
+{ name: 'salary',  type: Number,   acl: { read: ['admin', 'hr'] } }
+{ name: 'tags',    type: [String], acl: { update: ['admin'] } }
+{ name: 'notes',   type: String,   acl: { create: ['admin'], update: ['admin'] } }
+```
+
+| Slot | Effect |
+|------|--------|
+| `read` | The field is stripped from REST responses, GraphQL output, MCP tool results, search snippets, audit history rows, and webhook payloads for callers without an overlapping role. |
+| `create` | If a caller without an overlapping role supplies the field on `POST`, the framework silently strips it before insert. |
+| `update` | Same as `create`, but on `PUT` / GraphQL `UpdateById` / MCP `update_<path>`. |
+
+`create` and `update` strip rather than reject — an agent isn't trapped by a payload it didn't know was sensitive. If you need hard rejection, throw from a `beforeCreate` / `beforeUpdate` hook instead.
+
+## Combining document and field ACL
+
+A common pattern is to let `admin` and `support` see all rows, while keeping sensitive fields visible only to `admin` and `hr`:
+
+```js
+module.exports = {
+  path: 'employee',
+  acl: {
+    list: ['admin', 'support'],
+  },
+  fields: [
+    { name: 'userId',    type: String, required: true },
+    { name: 'accountId', type: String, required: true },
+    { name: 'name',      type: String, required: true },
+    { name: 'salary',    type: Number, acl: { read: ['admin', 'hr'] } },
+    { name: 'notes',     type: String, acl: { read: ['admin', 'hr'], update: ['admin'] } },
+  ],
+};
+```
+
+<CardGroup cols={3}>
+  <Card title="support user" icon="headset">
+    Can list rows from any tenant. `salary` and `notes` are stripped from every response.
+  </Card>
+  <Card title="admin user" icon="shield-check">
+    Can list every row and see every field, including `salary` and `notes`.
+  </Card>
+  <Card title="hr user" icon="user-tie">
+    Owner-only on the document level but sees `salary` and `notes` on rows they own.
+  </Card>
+</CardGroup>
+
+## ACL coverage across surfaces
+
+The same `projectByAcl` helper runs at every surface — there is no side channel that bypasses field-level ACL:
+
+| Surface | Where ACL runs |
+|---------|---------------|
+| REST `GET` (list / get / by-id) | After the database find. |
+| REST `POST` / `PUT` | Before the write (input filter via `filterWritable`). |
+| GraphQL output | `<path>Type.applyAclProjection` resolver wrapper. |
+| GraphQL input | `filterWritable` strips non-writable fields. |
+| MCP `list_*` / `get_*` | Same projector as REST. |
+| MCP `create_*` / `update_*` | Same input filter. |
+| Full-text search results | Before the response. |
+| Relations (`__include`) | Each populated record runs through the target schema's projector. |
+| Audit log `history` endpoint | Before / after / diff projections all ACL-filtered. |
+| Outbound webhook payloads | Same projector as audit. |
+
+## Roles in the JWT
+
+```json
+{
+  "user_id": "65a0...",
+  "email":   "admin@example.com",
+  "roles":   ["admin"]
+}
+```
+
+The framework reads `req.user.roles` on REST and `ctx.user.roles` in GraphQL and MCP contexts. Assign roles in your custom auth routes — the default `User` model issues `['user']` on registration.
+
+## Public-read bypass with `acl.scope`
+
+Use `acl.scope` to add a mandatory per-role filter that is `$and`-ed into every read. This is the pattern for public storefronts — map an unauthenticated caller's `X-Client-Id` header to a `storefront` role in your auth layer, then enforce a `{ published: true }` predicate server-side:
+
+```js
+acl: {
+  list: ['storefront'],
+  scope: {
+    storefront: { published: true },
+  },
+},
+```
+
+The scope filter is server-controlled and cannot be widened by the caller's own query parameters.
+
+## What ACL is not
+
+<Accordion title="Not row-level access beyond owner / role">
+  dAvePi supports owner-only or role-bypass. There is no "user A can read this specific document of user B" granularity. Layer a sharing collection on top if you need that.
+</Accordion>
+
+<Accordion title="Not OAuth scopes">
+  Roles are coarse — `admin`, `hr`, `support`, `user`. For fine-grained API scopes, generate scoped tokens at the auth layer and check them in custom routes.
+</Accordion>
+
+<Accordion title="Not policy-as-code">
+  No CEL, Rego, or OPA. The expressiveness is intentionally scoped to what fits in the schema vocabulary.
+</Accordion>
+
+## See also
+
+- [Tenant isolation](/concepts/tenancy) — owner-only is the baseline; ACL is opting out of it.
+- [Hooks](/features/hooks) — throw from `before*` to hard-reject writes on sensitive fields.
+- [Webhooks](/features/webhooks) — outbound payloads run through the same ACL projector.
+- [Audit log](/features/audit) — history rows are ACL-filtered before the response.

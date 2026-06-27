@@ -1,0 +1,323 @@
+---
+title: "Build a Customer Support Inbox in 25 Minutes"
+sidebarTitle: "Support Inbox"
+description: "Two collections with a relation, a beforeCreate auto-tag hook, and a Slack bot that renders open urgent tickets as a Block Kit table."
+---
+
+In this tutorial you build a small support inbox for a services business: customers, tickets linked to those customers, a hook that auto-tags urgent tickets before they hit the database, and a Slack bot that answers "what's open and urgent for Acme?" with a rendered table. By the end you'll have a live multi-collection backend, a lifecycle hook you didn't hand-write, and an aggregation available on REST, GraphQL, and MCP simultaneously.
+
+## Prerequisites
+
+- Node 18+, Docker, an Anthropic or OpenAI API key, and a Slack workspace with a bot. See the [common prerequisites](/tutorials/) if you haven't set these up yet.
+
+---
+
+## Scaffold the project
+
+Start by creating a blank dAvePi project and booting the local database:
+
+```bash
+npx create-davepi-app support-inbox --template blank
+cd support-inbox
+docker compose up -d
+npm start
+```
+
+Delete the placeholder schema that ships with the blank template — you won't need it:
+
+```bash
+rm schema/versions/v1/note.js
+```
+
+---
+
+## Write the two schemas
+
+Create `schema/versions/v1/customer.js`:
+
+```js
+module.exports = {
+  path: 'customer',
+  collection: 'customer',
+  fields: [
+    { name: 'userId', type: String, required: true },
+    { name: 'name', type: String, required: true, searchable: true, searchWeight: 5 },
+    { name: 'email', type: String, required: true },
+    { name: 'company', type: String, searchable: true },
+  ],
+};
+```
+
+Create `schema/versions/v1/ticket.js`:
+
+```js
+module.exports = {
+  path: 'ticket',
+  collection: 'ticket',
+  fields: [
+    { name: 'userId', type: String, required: true },
+    { name: 'customerId', type: String, required: true },
+    { name: 'subject', type: String, required: true, searchable: true, searchWeight: 5 },
+    { name: 'body', type: String, searchable: true },
+    {
+      name: 'status',
+      type: String,
+      enum: ['open', 'pending', 'closed'],
+      default: 'open',
+    },
+    { name: 'opened_at', type: Date, default: Date.now },
+  ],
+  relations: {
+    customer: { belongsTo: 'customer', localKey: 'customerId' },
+  },
+};
+```
+
+Save both files. The server hot-reloads in ~100 ms. Open the admin SPA at [http://localhost:5173](http://localhost:5173) — start it with `cd admin && npm install && npm run dev` if it isn't already running. Notice that the ticket form renders a searchable combobox for the customer field rather than a raw UUID input. The framework read the `relations.customer` declaration from `/_describe` and the admin rendered a `<RelationPicker>` automatically. Customer detail pages also auto-discover a Tickets tab via the backend-synthesised inverse `hasMany`. Zero UI code.
+
+---
+
+## Seed three customers
+
+Register an account and log in, then create some seed data:
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:5050/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"sup3rsecret!"}' | jq -r .accessToken)
+
+for c in "Acme Corp" "Globex" "Initech"; do
+  curl -s -X POST http://localhost:5050/api/v1/customer \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$c\",\"email\":\"hello@$(echo $c | tr A-Z a-z | tr -d ' ').com\",\"company\":\"$c\"}" > /dev/null
+done
+```
+
+---
+
+## Ask the agent to extend the schema
+
+Open the project in Claude Code. The `.mcp.json` shipped with your scaffold already points at the dAvePi MCP server. Ask:
+
+> Add a `priority` field to ticket (low / normal / high / urgent, default normal) and a `tags` array of strings.
+
+Claude edits `schema/versions/v1/ticket.js`. Hot reload picks it up. Verify the new fields are live:
+
+```bash
+curl -s http://localhost:5050/_describe \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq '.schemas[] | select(.path=="ticket").fields[] | select(.name | inside("priority,tags"))'
+```
+
+---
+
+## Ask the agent to add a `beforeCreate` hook
+
+In the same Claude session, ask:
+
+> Add a `beforeCreate` hook to ticket that auto-tags `urgent` if the subject contains 'down' or 'broken' (case-insensitive), and bumps the priority to `urgent` in that case.
+
+Claude updates the schema with a `hooks.beforeCreate` function. The result should look like this:
+
+```js
+hooks: {
+  beforeCreate: async ({ input }) => {
+    const subject = String(input.subject || '');
+    if (/\b(down|broken)\b/i.test(subject)) {
+      const tags = new Set([...(input.tags || []), 'urgent']);
+      return { ...input, tags: [...tags], priority: 'urgent' };
+    }
+  },
+},
+```
+
+A `before*` hook that returns a value **replaces** the input that gets persisted. Returning `undefined` keeps the input unchanged. See [Hooks](/features/hooks/).
+
+---
+
+## Seed tickets and verify the hook
+
+Create test tickets to confirm the auto-tagging fires:
+
+```bash
+ACME=$(curl -s "http://localhost:5050/api/v1/customer?__q=acme" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.results[0]._id')
+GLOBEX=$(curl -s "http://localhost:5050/api/v1/customer?__q=globex" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.results[0]._id')
+
+curl -s -X POST http://localhost:5050/api/v1/ticket \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"customerId\":\"$ACME\",\"subject\":\"Cannot reset 2FA\",\"body\":\"Got locked out.\"}"
+
+curl -s -X POST http://localhost:5050/api/v1/ticket \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"customerId\":\"$ACME\",\"subject\":\"Production is DOWN!\",\"body\":\"Status page is red.\"}"
+
+curl -s -X POST http://localhost:5050/api/v1/ticket \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"customerId\":\"$GLOBEX\",\"subject\":\"Search is broken on mobile\",\"body\":\"Results never load.\"}"
+```
+
+Open the admin UI: tickets with "DOWN" and "broken" in the subject should have `priority: urgent` and `tags: ["urgent"]` — applied automatically by the hook before the record was written.
+
+---
+
+## Add an aggregation
+
+Ask Claude to write an aggregation that gives you open ticket counts per customer:
+
+> Add an aggregation to ticket called `openByCustomer` that groups open tickets by customer and returns count per customer, sorted descending by count.
+
+Claude appends this to your ticket schema:
+
+```js
+aggregations: [
+  {
+    name: 'openByCustomer',
+    description: 'Open ticket count grouped by customer.',
+    pipeline: [
+      { $match: { status: 'open' } },
+      { $group: { _id: '$customerId', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+    ],
+    cache: { ttlSeconds: 30 },
+  },
+],
+```
+
+The same aggregation is now available on three surfaces simultaneously:
+
+| Surface | Path |
+|---------|------|
+| REST | `GET /api/v1/ticket/aggregations/openByCustomer` |
+| GraphQL | `ticketOpenByCustomer` |
+| MCP | `aggregate_ticket_openByCustomer` |
+
+---
+
+## Set up ACL: support sees all, users see theirs
+
+<Note>
+  The ticketing template ships with a two-state-machine ticket schema (status + priority) and an `internal` flag on comments gated by `acl: { read: ['staff', 'admin'] }`. If you started from the `ticketing` template instead of `blank`, this ACL is already wired. The steps below show how to add it manually.
+</Note>
+
+Ask Claude to add role-based scoping:
+
+> Add an `acl` block to the ticket schema so that callers with the `support` role can list all tickets (bypass the userId scope), while regular users only see their own.
+
+Claude adds:
+
+```js
+acl: {
+  list: ['support', 'admin'],
+},
+```
+
+With this in place, a `support` role bearer calling `GET /api/v1/ticket` sees every ticket regardless of `userId`. A regular user only ever sees their own rows. See [ACL](/features/acl/).
+
+---
+
+## Install and configure the agent
+
+```bash
+npm install @davepi/agent
+```
+
+Create `.env.agent` in the project root:
+
+```bash
+DAVEPI_URL=http://localhost:5050
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+DAVEPI_BEARER=eyJ...    # your /login access token
+```
+
+<Note>
+  Access tokens default to 15 minutes and service mode does **not** auto-refresh. For this tutorial, add `ACCESS_TOKEN_TTL=2h` to the dAvePi server's `.env`, restart the server, and log in again to get a two-hour token. For production, use [per-user auth mode](/agents/auth) instead.
+</Note>
+
+---
+
+## Wire Slack
+
+Follow the [Slack bot setup checklist](/agents/channels). Name the app `support-inbox-bot`. Then add to `.env.agent`:
+
+```bash
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_SIGNING_SECRET=...
+SLACK_SOCKET_MODE=true
+SLACK_APP_TOKEN=xapp-...
+```
+
+Start the agent:
+
+```bash
+set -a; source .env; source .env.agent; set +a
+npx davepi-agent
+```
+
+---
+
+## Ask the bot
+
+DM the bot and watch the tool chain in action:
+
+<Tabs>
+  <Tab title="Urgent tickets query">
+    ```
+    What's open and urgent for the Acme account? Show as a table.
+    ```
+
+    The agent:
+    1. Calls `search_customer` (or `list_customer` with `__q=acme`) to resolve "Acme" to a `customerId`.
+    2. Calls `list_ticket` with `filter: { customerId, status: 'open', priority: 'urgent' }`.
+    3. Calls `render_table` with the resulting rows.
+
+    You see a Block Kit table in Slack with columns for subject, priority, and `opened_at` — rendered natively, not as ASCII.
+  </Tab>
+  <Tab title="Aggregation query">
+    ```
+    Which customer has the most open tickets right now?
+    ```
+
+    The agent calls `aggregate_ticket_openByCustomer`, gets the grouped result, joins the top `_id` against `get_customer`, and replies: *"Acme Corp has 2 open tickets, the most of any customer."*
+  </Tab>
+  <Tab title="Chart query">
+    ```
+    Show me a chart of ticket volume by status, all customers.
+    ```
+
+    The agent groups from `list_ticket` (or via an aggregation if you have one), calls `render_chart` with a bar spec, and the chart appears inline in the channel.
+  </Tab>
+</Tabs>
+
+---
+
+## What you built
+
+<CardGroup cols={2}>
+  <Card title="Two related collections" icon="database">
+    Customer and ticket schemas with a `belongsTo` relation — hot-reloaded into REST, GraphQL, MCP, Swagger, and the admin SPA. Zero UI code.
+  </Card>
+  <Card title="Auto-tag hook" icon="bolt">
+    A `beforeCreate` hook that inspects the subject and bumps priority + tags before the record is written. Claude wrote it; the framework picked it up live.
+  </Card>
+  <Card title="Live aggregation" icon="chart-bar">
+    An `openByCustomer` aggregation available on all three surfaces, with a 30-second cache. Claude wrote this too.
+  </Card>
+  <Card title="Slack bot with table rendering" icon="slack">
+    A bot that resolves entity names, runs aggregations, and renders Block Kit tables and charts natively per channel.
+  </Card>
+</CardGroup>
+
+Total schema code you wrote by hand: ~40 lines. Total non-schema code: zero.
+
+---
+
+## What to read next
+
+- **[E-commerce Storefront](/tutorials/ecommerce-storefront)** — the same backend serving two audiences with different auth boundaries and server-enforced scope filters.
+- [Features → Hooks](/features/hooks/) — every lifecycle hook the framework supports.
+- [Features → Aggregations](/features/aggregations/) — what's expressible in declared aggregations.
+- [Features → ACL](/features/acl/) — field-level and document-level access control.

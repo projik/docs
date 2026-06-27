@@ -1,0 +1,157 @@
+---
+title: "Record Every Schema Mutation with the dAvePi Audit Log"
+sidebarTitle: "Audit Log"
+description: "Every create, update, delete, restore, and state-machine transition writes an immutable audit row — readable via REST, GraphQL, and MCP."
+---
+
+dAvePi writes an audit row on every mutation by default. Each row captures who made the change, when, and exactly what changed — including a field-level diff with before and after values. You can read a record's full history via a REST endpoint, a GraphQL resolver, or an MCP tool, and the same ACL rules that govern the record itself protect what appears in the history.
+
+## What Gets Recorded
+
+Every mutation on a schema with `audit: true` (the default) produces an entry in the `audit_log` collection:
+
+| Action | Triggered by |
+|--------|-------------|
+| `create` | `POST` / GraphQL `<path>CreateOne` / MCP `create_<path>` |
+| `update` | `PUT` / GraphQL `<path>UpdateById` / MCP `update_<path>` |
+| `delete` | `DELETE` — soft or hard |
+| `restore` | `POST /:id/restore` |
+| `transition` | Any state-machine transition |
+
+Each entry is written in a fire-and-forget pattern after the mutation succeeds. A failure to write the audit row is logged but does not fail the caller's request.
+
+## Audit Entry Shape
+
+```json
+{
+  "_id":         "65c0...",
+  "schemaPath":  "quote",
+  "documentId":  "65b1...",
+  "action":      "transition",
+  "userId":      "65a0...",
+  "before":      { "status": "review" },
+  "after":       { "status": "approved" },
+  "diff":        { "status": { "from": "review", "to": "approved" } },
+  "field":       "status",
+  "createdAt":   "2026-05-10T12:00:00Z"
+}
+```
+
+<ParamField path="schemaPath" type="string">
+  The schema path the mutated record belongs to (e.g. `"quote"`).
+</ParamField>
+
+<ParamField path="documentId" type="string">
+  The `_id` of the record that changed.
+</ParamField>
+
+<ParamField path="action" type="string">
+  One of `create`, `update`, `delete`, `restore`, or `transition`.
+</ParamField>
+
+<ParamField path="userId" type="string">
+  The actor's tenant identity, taken from the JWT.
+</ParamField>
+
+<ParamField path="before / after" type="object">
+  Document projections at each end of the change. ACL-projected at read time — hidden fields never appear in history.
+</ParamField>
+
+<ParamField path="diff" type="object">
+  Field-level map of `{ from, to }` pairs. Only fields that changed are included. For `create` rows, `from` is `null`; for `delete` rows, `to` is `null`.
+</ParamField>
+
+<ParamField path="field" type="string">
+  Set on `transition` rows only — the state-machine field that moved.
+</ParamField>
+
+## Read History
+
+### REST
+
+```http
+GET /api/v1/quote/abc/history
+Authorization: Bearer <token>
+```
+
+Results are returned newest-first and support the same pagination parameters as list endpoints (`__page`, `__sort`):
+
+```json
+{
+  "results": [
+    { "action": "transition", "field": "status", "diff": { "status": { "from": "review", "to": "approved" } }, "createdAt": "..." },
+    { "action": "update",     "diff": { "amount": { "from": 100, "to": 150 } }, "createdAt": "..." },
+    { "action": "create",     "after": { "status": "draft", "amount": 100 }, "createdAt": "..." }
+  ]
+}
+```
+
+### GraphQL
+
+```graphql
+{
+  quoteHistory(_id: "abc") {
+    action
+    field
+    before
+    after
+    diff
+    createdAt
+  }
+}
+```
+
+### MCP
+
+```json
+{
+  "name": "history_quote",
+  "arguments": { "id": "abc" }
+}
+```
+
+### Typed Client
+
+```ts
+const history = await api.quote.history('abc');
+// AuditEntry[] — with a discriminated `action` field
+```
+
+## ACL Projection on History
+
+The `before`, `after`, and `diff` objects in every history row are run through the schema's ACL projector **at read time**. A user without the required role on a field (e.g. `acl: { read: ['admin'] }` on `salary`) will not see that field's changes in history — even if they can see the rest of the record.
+
+The same projection applies to outbound webhook payloads, so there is no side channel that bypasses your ACL configuration.
+
+<Note>
+History reads honour the schema's `acl.list` slot. Roles listed there can read any record's history. Without `acl.list`, history is owner-only.
+</Note>
+
+## Disable Audit Logging
+
+For high-volume schemas where audit rows would dwarf the data (session events, analytics rows, ephemeral caches), opt out per schema:
+
+```js
+module.exports = {
+  path: 'session_event',
+  audit: false,
+  fields: [/* ... */],
+};
+```
+
+When `audit: false`, no rows are written, and the `history` REST endpoint, GraphQL resolver, and MCP tool are not generated for that schema.
+
+## Retention and Pruning
+
+The `audit_log` collection grows linearly with mutations. dAvePi does **not** auto-purge audit rows. To enforce a retention window, run a periodic cron job:
+
+```js
+// Keep 1 year of audit rows. Run weekly.
+db.audit_log.deleteMany({
+  createdAt: { $lt: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000) },
+});
+```
+
+<Warning>
+Plan your audit log retention policy before going to production. A schema with frequent updates can accumulate millions of rows quickly. Index `createdAt` on the `audit_log` collection if you intend to prune on a schedule.
+</Warning>

@@ -1,0 +1,97 @@
+---
+title: "Schema-Driven Generation: One File, Every Surface"
+sidebarTitle: "Schema-Driven"
+description: "Drop a schema file under schema/versions/v1/ and dAvePi generates REST routes, GraphQL types, MCP tools, Swagger docs, and an admin UI automatically."
+---
+
+dAvePi's central idea is that your schema file is the single source of truth and everything else is a projection from it. You write a plain JavaScript object describing a resource — its path, its MongoDB collection, and its fields — and the framework derives every customer-facing surface from that description automatically.
+
+## The minimum viable schema
+
+Here is everything you need to get a fully working resource:
+
+```js
+// schema/versions/v1/account.js
+module.exports = {
+  path: 'account',
+  collection: 'account',
+  fields: [
+    { name: 'userId', type: String, required: true },
+    { name: 'name',   type: String, required: true, searchable: true },
+  ],
+};
+```
+
+That's all you write. At boot, the framework builds the following from that file.
+
+## What gets generated
+
+<CardGroup cols={2}>
+  <Card title="Mongoose model" icon="database">
+    Registered with the MongoDB connection. Timestamps, soft-delete tombstone, composite indexes, and a full-text index for every `searchable: true` field are built automatically.
+  </Card>
+  <Card title="REST routes" icon="route">
+    `POST`, `GET` (list), `PUT` (bulk), `GET /:id`, `PUT /:id`, `DELETE /:id`, plus `restore`, `history`, `aggregations`, and file upload routes — all mounted under `/api/v1/<path>`.
+  </Card>
+  <Card title="GraphQL types" icon="code-branch">
+    Output type, input types (writable / partial / filter), and every standard resolver via `graphql-compose-mongoose`. Tenant scoping wraps every resolver at the GraphQL layer too.
+  </Card>
+  <Card title="MCP tools" icon="robot">
+    One tool per CRUD operation, plus per-aggregation and per-relation tools, registered on the MCP server so AI agents can call them natively.
+  </Card>
+  <Card title="Swagger fragment" icon="file-code">
+    Paths and definitions wired into the live spec served at `/api-docs/swagger.json`. Open `/api-docs` and your new resource is already documented.
+  </Card>
+  <Card title="Admin SPA resource" icon="browser">
+    The Refine-based admin reads `/_describe` at startup and renders forms, tables, and detail views for every loaded schema — no per-resource code.
+  </Card>
+</CardGroup>
+
+Running `davepi gen-client` after boot also emits per-resource TypeScript interfaces and method signatures, so your frontend is type-checked against the same schema.
+
+## Adding a field updates everything
+
+The real payoff is what happens when you extend an existing schema. Add a `region` field to `deal.js`:
+
+```js
+{ name: 'region', type: String, enum: ['NA', 'EMEA', 'APAC'], default: 'NA' }
+```
+
+Save the file. Every surface updates automatically:
+
+- The REST `POST` body schema accepts `region`.
+- The GraphQL input type includes `region`.
+- The MCP `create_deal` tool's input schema validates `region`.
+- The Swagger UI shows `region` in the request and response models.
+- The admin SPA renders a select input for `region` on the next page load.
+- The next `davepi gen-client` run emits a `region` TypeScript field.
+
+There is no backend/frontend drift. There is no "I forgot to update the GraphQL schema." There is no mismatch between the OpenAPI spec and what the server actually accepts.
+
+<Tip>
+  In development, set `HOT_RELOAD_SCHEMAS=true` before starting the server. Schema file changes are picked up in 50–150ms without a restart. See [Hot Reload](/concepts/hot-reload).
+</Tip>
+
+## How the generation works internally
+
+`utils/schemaLoader.js` walks `schema/versions/*` once at startup. For each schema it:
+
+1. Builds a Mongoose schema with timestamps, soft-delete, composite indexes, and the full-text index for searchable fields.
+2. Composes a Mongoose-derived type composer in graphql-compose's registry, wrapping every standard resolver with `wrapFilter` / `wrapByIdMutation` so tenant scoping is non-bypassable.
+3. Mounts a per-schema Express Router carrying every REST route.
+4. Emits a Swagger fragment into the live `apiSpec` object served at `/api-docs/swagger.json`.
+5. Registers MCP tools via `utils/mcpServer.js` against the same registry.
+
+Per-schema routers are mounted on the parent app via `app.use(router)`. During [hot reload](/concepts/hot-reload), a schema unload splices only that router out — the rest of the stack is untouched.
+
+## What dAvePi does not do
+
+Understanding the tradeoffs helps you decide when to reach for a custom route instead.
+
+<Warning>
+  Every resource follows the same shape: CRUD + tenancy + soft-delete. If you need a wildly bespoke surface, add custom routes in `app.js` after the schema loop — the framework is designed to coexist with hand-written handlers.
+</Warning>
+
+- **Bespoke logic**: the schema loop generates a consistent API shape. For non-standard behaviour, use [lifecycle hooks](/features/hooks) (`beforeCreate`, `afterCreate`, etc.) declared directly on the schema, or a custom Express route.
+- **SQL databases**: dAvePi is built on Mongoose. Relational backends are not supported.
+- **Multiple ownership columns**: every schema has exactly one tenant column (`userId`). Multi-org models layer on top via `accountId` or custom relation fields — see [Tenant Isolation](/concepts/tenancy).

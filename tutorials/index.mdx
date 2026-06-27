@@ -1,0 +1,79 @@
+---
+title: "Tutorials: Real-World Apps Built with dAvePi"
+sidebarTitle: "Tutorials"
+description: "Five end-to-end tutorials that walk you from a blank scaffold to a fully deployed app — each one introduces a new capability on top of the last."
+---
+
+These tutorials walk you through building complete, production-shaped applications with dAvePi. Each one follows the same arc: scaffold a project, define your schema, extend it with hooks or plugins, wire up the agent, and deploy. The escalation between tutorials is in *what* the agent does and *who* it does it for — not in how much code you write. By the last tutorial you'll have a Slack bot that reads internal runbooks, searches the web, opens tickets, and respects your access-control boundaries automatically.
+
+## Prerequisites
+
+Before you start any tutorial, make sure you have the following set up once:
+
+- **Node 18+** and **Docker** (for the local MongoDB instance)
+- An **Anthropic or OpenAI API key** — `ANTHROPIC_API_KEY=sk-ant-...` or `OPENAI_API_KEY=sk-...`
+- A throwaway **Slack workspace** with a bot you control (each tutorial walks through the five-minute setup; you can reuse the same bot across tutorials)
+- **`ngrok`** or Slack socket mode to receive Slack events during local development
+
+<Note>
+  If you've never used dAvePi before, run through the [Quickstart](/quickstart/) first — it's a five-minute orientation to the schema → admin → MCP loop before an agent enters the picture.
+</Note>
+
+## The tutorials
+
+<CardGroup cols={2}>
+  <Card title="Customer Support Inbox" icon="inbox" href="/tutorials/customer-support-inbox">
+    Build a multi-customer support inbox with ticket state machines, auto-tagging hooks, and a Slack bot that answers "what's open and urgent for Acme?" with a rendered table.
+
+    **~25 minutes · Relations · Hooks · Aggregations**
+  </Card>
+  <Card title="E-commerce Storefront" icon="store" href="/tutorials/ecommerce-storefront">
+    One backend, two audiences: staff query inventory in Slack while customers browse a public widget that only ever sees published, in-stock products — enforced server-side.
+
+    **~35 minutes · Dual auth · ACL scopes · Public reads**
+  </Card>
+  <Card title="Multi-Tenant Bookings SaaS" icon="calendar" href="/tutorials/multi-tenant-bookings">
+    A Calendly-style booking platform with full tenant isolation, Twilio SMS reminders, Stripe checkout, and an agent that fans out bulk SMS after you approve the list.
+
+    **~60 minutes · Multi-tenancy · Twilio · Stripe · Approval gates**
+  </Card>
+  <Card title="Real Estate Leads" icon="house" href="/tutorials/real-estate-leads">
+    Listings with photo uploads, a lead funnel state machine, and a passive Slack plugin that fires on every CRUD event — no glue code. The interactive bot handles analytics on demand.
+
+    **~45 minutes · State machines · Plugins · Event bus**
+  </Card>
+  <Card title="Internal IT Helpdesk" icon="headset" href="/tutorials/internal-it-helpdesk">
+    A Slack assistant that checks runbooks first, falls back to web search, and opens tickets when nothing resolves the issue — with a confused-deputy guard that proves the JWT is the real access boundary.
+
+    **~45 minutes · Custom MCP tools · System prompt routing · ACL guardrails**
+  </Card>
+</CardGroup>
+
+## The common thread
+
+Every tutorial follows the same shape, and that shape is the point:
+
+<Steps>
+  <Step title="Scaffold">
+    Run `npx create-davepi-app <name> --template blank` (or another template). You get a running server, admin SPA, REST API, GraphQL API, MCP server, and Swagger docs in under a minute.
+  </Step>
+  <Step title="Define your schema">
+    Drop a `.js` file into `schema/versions/v1/`. Hot reload picks it up in ~100 ms — no restart, no code generation step. Every surface updates automatically.
+  </Step>
+  <Step title="Extend with the agent">
+    Open the project in Claude Code. Ask for new fields, hooks, aggregations, or ACL rules in plain English. Claude edits the schema file; the framework picks it up live.
+  </Step>
+  <Step title="Add plugins">
+    Install a plugin package, add it to the `davepi.plugins` array in `package.json`, set the relevant env vars, and restart. The Slack notification plugin, Twilio, Stripe, and cron all follow this pattern.
+  </Step>
+  <Step title="Wire the agent">
+    Install `@davepi/agent`, point it at your backend, and start it. In service mode it uses a single bearer token; in per-user mode it maps each Slack identity to a real dAvePi user.
+  </Step>
+  <Step title="Deploy">
+    The same `npm start` command runs in production. Swap `MONGO_URI` for your Atlas connection string, set `NODE_ENV=production`, and you're done.
+  </Step>
+</Steps>
+
+<Tip>
+  The line that summarises the whole stack: *"You wrote one schema file. You wrote zero glue code. The admin UI, the REST API, the GraphQL API, the MCP server, the audit log, the Slack bot, the SMS reminders, and the customer-facing chat widget all came from that file."*
+</Tip>

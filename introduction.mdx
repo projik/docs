@@ -1,0 +1,88 @@
+---
+title: "dAvePi: Schema-Driven Backend for AI-Native Apps"
+sidebarTitle: "Introduction"
+description: "dAvePi generates a complete backend — REST, GraphQL, MCP server, admin SPA, and typed client — from a single schema file. Build faster with AI agents."
+---
+
+dAvePi is a schema-driven backend framework that turns a single configuration file into a fully working production backend. Write one schema, and dAvePi automatically generates REST and GraphQL APIs, an MCP server for AI agents, live Swagger documentation, an admin dashboard, and a typed TypeScript client — all kept in lockstep as your data model evolves.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    From zero to a running API in under 60 seconds with a scaffold template.
+  </Card>
+  <Card title="CRM in 10 Minutes" icon="timer" href="/guides/crm-in-10-minutes">
+    The flagship walkthrough — scaffold, extend, and deploy a real CRM app.
+  </Card>
+  <Card title="Schema Reference" icon="book" href="/reference/schema">
+    Every key the schema loader recognises, with examples.
+  </Card>
+  <Card title="API Surfaces" icon="code" href="/surfaces/rest">
+    REST, GraphQL, MCP, typed client, and the capability manifest.
+  </Card>
+</CardGroup>
+
+## What you get from one schema file
+
+Drop a file like this into `schema/versions/v1/`:
+
+```js schema/versions/v1/project.js
+module.exports = {
+  path: 'project',
+  collection: 'project',
+  fields: [
+    { name: 'userId',  type: String, required: true },
+    { name: 'name',    type: String, required: true, searchable: true },
+    { name: 'status',  type: String, enum: ['active', 'archived'], default: 'active' },
+    { name: 'dueDate', type: Date },
+  ],
+};
+```
+
+And dAvePi instantly provides:
+
+<CardGroup cols={3}>
+  <Card title="REST API" icon="globe">
+    Full CRUD at `/api/v1/project` — create, list, filter, paginate, update, delete, restore, history.
+  </Card>
+  <Card title="GraphQL" icon="diagram-project">
+    Apollo Server with auto-generated queries, mutations, and types via graphql-compose-mongoose.
+  </Card>
+  <Card title="MCP Server" icon="robot">
+    Native tools so Claude Code, Cursor, and Claude Desktop call your API without integration glue.
+  </Card>
+  <Card title="Swagger UI" icon="file-code">
+    Live OpenAPI documentation at `/api-docs`, always in sync with your schemas.
+  </Card>
+  <Card title="Admin SPA" icon="table-columns">
+    A polished React admin (davepi-ui) with searchable tables, relation pickers, and file upload widgets.
+  </Card>
+  <Card title="Typed Client" icon="brackets-curly">
+    Run `npx davepi gen-client` to emit a fully-typed TypeScript client for your frontend.
+  </Card>
+</CardGroup>
+
+## Key capabilities
+
+- **Multi-tenant by default** — every record is automatically scoped to its owner. One user can never read another's data through any surface.
+- **Role-based access control** — document-level and field-level ACL gates applied symmetrically across REST, GraphQL, and MCP.
+- **Plugin ecosystem** — switch on auth (magic-link, OAuth, SMS), Stripe billing, Slack/email/SMS notifications, full-text search, file storage, job queues, and Sentry with a single config line.
+- **AI agent layer** — run chat agents with personas, durable memory, governed skill runbooks, and per-user profiles on top of your data.
+- **Lifecycle hooks & webhooks** — react to create/update/delete events both inside your app and in external systems.
+- **State machines** — model business workflows (e.g. `draft → review → published`) and enforce valid transitions automatically.
+
+## Explore by goal
+
+<CardGroup cols={2}>
+  <Card title="Core Concepts" icon="lightbulb" href="/concepts/schema-driven">
+    Understand how one schema file powers every surface.
+  </Card>
+  <Card title="Features" icon="sparkles" href="/features/acl">
+    ACL, hooks, state machines, webhooks, aggregations, and more.
+  </Card>
+  <Card title="Plugins" icon="plug" href="/plugins/overview">
+    Auth, payments, messaging, search, storage, queues, and observability.
+  </Card>
+  <Card title="AI Agents" icon="robot" href="/agents/overview">
+    Deploy chat agents backed by your dAvePi data and the MCP server.
+  </Card>
+</CardGroup>

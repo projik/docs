@@ -1,0 +1,204 @@
+---
+title: "Backup, Restore, and Data Retention for dAvePi"
+sidebarTitle: "Backup"
+description: "What to back up, what dAvePi purges automatically, how to configure retention, and how to restore — with platform-specific guidance."
+---
+
+dAvePi stores everything it cares about in two places: **MongoDB** for every record, audit row, idempotency token, webhook delivery, and migration record; and **file storage** (local disk, S3, or GCS) for blobs from `type: 'File'` fields. Backups need to cover both. Restores need to put both back in sync.
+
+## What to back up
+
+Back up the entire database, with two exceptions:
+
+| Collection | Back up? | Why |
+|------------|----------|-----|
+| Every schema-driven collection | **yes** | This is your application data. |
+| `audit_log` | **yes** | Compliance and post-incident forensics. The framework never auto-purges audit rows. |
+| `_migrations` | **yes** | Losing this causes the migration runner to think all migrations are pending. Catastrophic if they aren't idempotent. |
+| `webhook_delivery` | **yes** | Delivery telemetry. The framework doesn't auto-purge it — it grows linearly with mutations. |
+| `idempotency_key` | optional | Auto-purged after `IDEMPOTENCY_TTL_SECONDS` (default 24h). It's a retry-correctness mechanism, not history. |
+
+## MongoDB backup options
+
+<Tabs>
+  <Tab title="MongoDB Atlas">
+    Atlas M10 and above include continuous backups driven by the oplog. This gives you sub-minute RPO and point-in-time restore to any second within your retention window.
+
+    **To enable continuous backup:**
+    1. In the Atlas UI, open your cluster and go to **Backup**.
+    2. Select **Continuous Backup** (or **Cloud Backup** with the continuous option enabled).
+    3. Set your retention window (default is 2 days; extend to 7–30 days for production).
+
+    **To restore a snapshot:**
+    1. In the Atlas UI, go to **Backup → Snapshots**.
+    2. Select a snapshot or choose a point-in-time.
+    3. Click **Restore** and choose the target cluster.
+
+    <Tip>
+      Atlas handles index rebuild, replica sync, and connection string continuity automatically after a restore. For non-Atlas setups you need to manage this yourself.
+    </Tip>
+  </Tab>
+  <Tab title="Self-hosted (mongodump)">
+    For self-hosted MongoDB on a VM or in a Docker Compose stack, use `mongodump` and `mongorestore`.
+
+    **Take a snapshot:**
+
+    ```bash
+    mongodump \
+      --uri="mongodb://localhost:27017/davepi" \
+      --out="/backups/$(date +%Y-%m-%d-%H%M%S)"
+    ```
+
+    **Restore from a snapshot:**
+
+    ```bash
+    mongorestore \
+      --uri="mongodb://localhost:27017/davepi" \
+      --drop \
+      /backups/2026-05-01-120000/davepi
+    ```
+
+    The `--drop` flag drops existing collections before restoring. Omit it for additive restores.
+
+    **Automate with cron:**
+
+    ```bash
+    # /etc/cron.d/davepi-backup
+    # Daily backup at 02:00, kept for 7 days
+    0 2 * * * root mongodump --uri="$MONGO_URI" --out="/backups/$(date +\%Y-\%m-\%d)" \
+      && find /backups -maxdepth 1 -mtime +7 -exec rm -rf {} +
+    ```
+
+    Upload the dump directory to S3 or another off-host store immediately after — a backup that lives only on the same disk as the database it's backing up is not a backup.
+
+    **Estimated RPO / RTO:**
+
+    | Schedule | RPO | RTO (small DB) |
+    |----------|-----|----------------|
+    | Daily cron | 24 hours | 30–60 min |
+    | Hourly cron | 1 hour | 30–60 min |
+  </Tab>
+</Tabs>
+
+## File storage backup
+
+Back up uploaded blobs separately from MongoDB. The database stores a `FileMeta` document that references the blob's storage path — if the blob is gone, the reference is broken.
+
+<Tabs>
+  <Tab title="S3 / R2 / GCS — bucket versioning">
+    Enable object versioning on your bucket. Versioning retains every overwrite and delete as a non-current version, giving you a full history without running a separate backup job.
+
+    ```bash
+    # Enable versioning on an S3 bucket
+    aws s3api put-bucket-versioning \
+      --bucket acme-davepi-uploads \
+      --versioning-configuration Status=Enabled
+    ```
+
+    To restore a deleted object, list non-current versions and copy the desired version back:
+
+    ```bash
+    aws s3api list-object-versions --bucket acme-davepi-uploads --prefix uploads/
+    aws s3api copy-object \
+      --copy-source "acme-davepi-uploads/uploads/logo.png?versionId=<id>" \
+      --bucket acme-davepi-uploads \
+      --key uploads/logo.png
+    ```
+
+    Add a lifecycle rule to expire old non-current versions after your desired retention window to control storage costs.
+  </Tab>
+  <Tab title="Local disk">
+    Local storage (`STORAGE_DRIVER=local`) writes blobs under `UPLOADS_DIR` (default `./uploads`). Include this directory in your server backup strategy.
+
+    ```bash
+    # Sync uploads to S3 after each mongodump
+    aws s3 sync ./uploads s3://acme-davepi-uploads-backup/$(date +%Y-%m-%d)/
+    ```
+
+    <Warning>
+      Files stored on a single host's disk are lost if that host's disk fails. Pair local storage with regular off-host syncs, or switch to `STORAGE_DRIVER=s3` for production.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## Framework-managed retention
+
+dAvePi automatically purges some data. For everything else, you manage the retention yourself.
+
+| Collection | Auto-purged? | Configured via |
+|------------|-------------|----------------|
+| `idempotency_key` | **yes** | `IDEMPOTENCY_TTL_SECONDS` env var (default 24h). MongoDB's TTL monitor sweeps expired rows on its background cycle (~60s). |
+| Soft-deleted records | optional | `softDelete: { retentionDays: N }` on the schema, or `SOFT_DELETE_RETENTION_DAYS` env var for a global default. |
+| `audit_log` | **no** | Manual pruning. The framework records every mutation but never deletes audit rows. |
+| `webhook_delivery` | **no** | Manual pruning. Same posture as audit. |
+
+### Configuring soft-delete retention
+
+Opt in per schema or globally via the environment variable:
+
+<CodeGroup>
+```js Per-schema (schema file)
+module.exports = {
+  path: 'contact',
+  softDelete: { retentionDays: 30 },  // hard-delete tombstones after 30 days
+  fields: [/* ... */],
+};
+```
+
+```bash Global (environment variable)
+# Applies to every schema that doesn't set its own retentionDays
+SOFT_DELETE_RETENTION_DAYS=30
+```
+</CodeGroup>
+
+A periodic sweep hard-deletes rows whose `deletedAt` is older than the configured retention. The matching file blobs (for `type: 'File'` fields) are removed from storage at the same time. This is useful for GDPR / right-to-be-forgotten compliance windows.
+
+Without `retentionDays` and without `SOFT_DELETE_RETENTION_DAYS`, tombstoned rows live forever.
+
+### Pruning the audit log manually
+
+`audit_log` grows linearly with mutations. If your audit volume is high or your compliance window is bounded, prune the collection on a cron:
+
+```js
+// Keep 1 year of audit rows — run weekly
+db.audit_log.deleteMany({
+  createdAt: { $lt: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000) },
+});
+```
+
+## Snapshot before destructive operations
+
+Take a database snapshot before any of these:
+
+| Operation | Why |
+|-----------|-----|
+| Running a migration (`npx davepi migrate up`) | Migrations are idempotent and have a `down`, but a snapshot is your safety net if the data shape is unexpected. |
+| Bulk delete via the admin SPA | No soft-delete undo for bulk operations. |
+| `npx davepi migrate down` | `down` is best-effort — some operations have no clean inverse. |
+| Shortening `softDelete.retentionDays` | The next sweep hard-deletes rows that fall outside the new window. Snapshot first. |
+
+## Restore drill
+
+An untested backup is not a backup. Schedule a restore drill at least once per quarter:
+
+<Steps>
+  <Step title="Take a fresh snapshot">
+    Run `mongodump` (or trigger an Atlas on-demand snapshot) and download the dump to a separate machine or bucket.
+  </Step>
+  <Step title="Restore to a non-production cluster">
+    Stand up a temporary MongoDB instance (a free Atlas M0 is fine for a drill) and run `mongorestore` against it.
+  </Step>
+  <Step title="Point a staging dAvePi instance at it">
+    Set `MONGO_URI` to the temporary cluster's connection string and start the server. Verify that schemas load, that a sample read returns expected data, and that the migration status matches production.
+  </Step>
+  <Step title="Verify file storage">
+    If you use S3, list a sample of objects in the backup bucket and confirm they are accessible. Attempt to download one and confirm the contents are intact.
+  </Step>
+  <Step title="Record the RTO">
+    Note how long the full restore took. Use that number to set or revisit your recovery time objective.
+  </Step>
+</Steps>
+
+<Note>
+  The `_migrations` collection is critical to include in your restore. Losing it causes the migration runner to believe all migrations are pending on next start. If your migrations are not fully idempotent, re-running them against a partially-migrated database can corrupt data.
+</Note>

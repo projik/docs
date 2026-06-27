@@ -1,0 +1,272 @@
+---
+title: "Build and Deploy a Full CRM in 10 Minutes"
+sidebarTitle: "CRM in 10 Min"
+description: "Scaffold a CRM with accounts, contacts, deals, and activities. Extend it with Claude Code, deploy to the cloud, and generate a typed TS client."
+---
+
+This guide takes you from nothing to a running CRM — with accounts, contacts, deals (including a state machine), activities, an admin SPA, and Claude Code wired in — in ten minutes flat. The only prerequisites are Node 18+, Docker, and Claude Code.
+
+## 0:00 — Scaffold
+
+Run the scaffolder with the `crm` template:
+
+```bash
+npx create-davepi-app acme-crm --template crm
+cd acme-crm
+```
+
+The scaffolder ships four schemas, a pre-configured `.mcp.json`, an `agent.md` for Claude, and a ready-to-run `docker-compose.yml`:
+
+```
+acme-crm/
+├── schema/versions/v1/
+│   ├── account.js          ← Accounts (companies)
+│   ├── contact.js          ← People at companies
+│   ├── deal.js             ← Deals (with stage state machine)
+│   └── activity.js         ← Calls / emails / meetings
+├── docker-compose.yml      ← Mongo on 27017
+├── .env                    ← TOKEN_KEY, MONGO_URI, etc.
+├── .mcp.json               ← Claude Code MCP wiring
+├── agent.md                ← Conventions for the agent
+└── package.json
+```
+
+## 1:00 — Boot
+
+`create-davepi-app` already ran `npm install` for you. Start MongoDB and the server:
+
+```bash
+docker compose up -d    # local Mongo
+npm start               # binds to 5050 by default
+```
+
+You should see:
+
+```
+{"level":"info","msg":"listening","port":5050}
+```
+
+## 2:00 — Try the REST surface
+
+Register a user, log in, and hit `/api/v1/account`:
+
+```bash
+curl -s -X POST http://localhost:5050/register \
+  -H 'Content-Type: application/json' \
+  -d '{"first_name":"Me","last_name":"Demo","email":"me@example.com","password":"sup3r-secret-pw!"}' | jq
+
+TOKEN=$(curl -s -X POST http://localhost:5050/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"me@example.com","password":"sup3r-secret-pw!"}' \
+  | jq -r .accessToken)
+
+curl -s http://localhost:5050/api/v1/account \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
+
+Empty results — the database is empty. Seed it next.
+
+## 3:00 — Seed sample data
+
+```bash
+npm run seed
+```
+
+You now have dozens of accounts, contacts, and deals. The seed also registers a `demo@example.com` user. Open these surfaces in a browser:
+
+| Surface | URL |
+|---------|-----|
+| Swagger UI | `http://localhost:5050/api-docs` |
+| Apollo Sandbox | `http://localhost:5050/graphql/` |
+| Capability manifest | `http://localhost:5050/_describe` |
+| Admin SPA | `http://localhost:5173` |
+
+<Tip>
+  The admin SPA renders entirely from `/_describe` — forms, tables, detail views, and child tabs all flow from your schema files. No per-resource wiring required.
+</Tip>
+
+Start the admin in a separate terminal:
+
+```bash
+cd admin && npm install && npm run dev
+```
+
+## 4:00 — Add a custom field
+
+Open `schema/versions/v1/deal.js` in your editor and add a `region` field:
+
+```js
+fields: [
+  // ... existing fields ...
+  { name: 'region', type: String, enum: ['NA', 'EMEA', 'APAC'], default: 'NA' },
+],
+```
+
+Save the file. With `nodemon` running via `npm start`, the server picks up the change in 50–150ms — no restart. The Apollo router rebuilds, Swagger updates, MCP tools refresh, and the admin SPA shows the new form field on next page load.
+
+Verify the field appeared in the manifest:
+
+```bash
+curl -s http://localhost:5050/_describe \
+  | jq '.schemas[] | select(.path=="deal").fields[] | select(.name=="region")'
+```
+
+## 5:00 — Hand the keyboard to Claude Code
+
+Open the project in Claude Code (`claude` from the project directory). The `.mcp.json` connects Claude to the dAvePi MCP server, and `agent.md` encodes the framework conventions.
+
+Ask Claude:
+
+> Add a `lostReason` field to deal that's only populated when stage is `lost`, and an aggregation that groups `lost` deals by reason so I can see which ones we're losing most.
+
+Claude reads the schema through the MCP `_describe` tool, edits `deal.js`, and the framework picks it up live. The aggregation appears immediately on three surfaces:
+
+| Surface | Endpoint |
+|---------|----------|
+| REST | `GET /api/v1/deal/aggregations/lostByReason` |
+| GraphQL | `dealLostByReason` |
+| MCP | `aggregate_deal_lostByReason` |
+
+Same source file — three surfaces. See [Schema-driven generation](/concepts/schema-driven) for how this works.
+
+## 6:00 — Exercise the state machine
+
+The `crm` template ships with a deal `stage` state machine: `prospect → qualifying → proposal → negotiation → won/lost`. Transition a deal:
+
+```bash
+DEAL_ID=$(curl -s "http://localhost:5050/api/v1/deal?__sort=createdAt:desc&__perPage=1" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.results[0]._id')
+
+curl -s -X PUT "http://localhost:5050/api/v1/deal/$DEAL_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"stage":"qualifying"}' | jq
+```
+
+Try an invalid transition to see the structured error:
+
+```bash
+curl -s -X PUT "http://localhost:5050/api/v1/deal/$DEAL_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"stage":"won"}' | jq
+```
+
+```json
+{
+  "error": {
+    "code": "INVALID_TRANSITION",
+    "message": "Cannot transition stage from 'qualifying' to 'won'",
+    "details": {
+      "current": "qualifying",
+      "attempted": "won",
+      "allowed": ["proposal", "lost"]
+    }
+  }
+}
+```
+
+<Note>
+  The `details.allowed` array lets agents self-correct without human intervention. See [State machines](/features/state-machines) for the full transition syntax.
+</Note>
+
+## 7:00 — Deploy
+
+Pick the deployment path that fits your workflow:
+
+<Tabs>
+  <Tab title="Render">
+    Push the repo to GitHub, then in Render:
+
+    ```
+    New Web Service → connect repo → Node
+    Build Command:  npm install
+    Start Command:  node index.js
+    ```
+
+    Add the env vars from your `.env` (use a fresh strong `TOKEN_KEY`) and point `MONGO_URI` at MongoDB Atlas.
+  </Tab>
+  <Tab title="Fly.io">
+    ```bash
+    fly launch                   # picks Node, generates fly.toml
+    fly secrets set MONGO_URI=mongodb+srv://...  TOKEN_KEY=...
+    fly deploy
+    ```
+  </Tab>
+  <Tab title="Railway">
+    ```bash
+    railway init
+    railway up
+    ```
+
+    Railway auto-detects Node and runs `node index.js`.
+  </Tab>
+</Tabs>
+
+For all three platforms, the [Deployment guide](/operations/deployment) has the full environment variable list and the `NODE_ENV=production` posture.
+
+## 8:00 — Generate a typed TypeScript client
+
+Generate a fully-typed client for the frontend you're about to build:
+
+```bash
+npx davepi gen-client --out ./client/davepi.ts \
+  --base-url https://acme-crm.fly.dev
+```
+
+Every resource, every method, every state-machine literal, and every relation name is type-checked at compile time:
+
+```ts
+import { createDavepiClient } from './client/davepi';
+
+const api = createDavepiClient({
+  baseUrl: 'https://acme-crm.fly.dev',
+  getToken: () => localStorage.getItem('token') || '',
+});
+
+const won = await api.deal.list({ filter: { stage: 'won' } });
+//                                          ^^^^^^^^
+// 'won' is typed as a literal; 'wno' is a red squiggle.
+
+await api.deal.transitionStage(dealId, 'proposal');
+//                                       ^^^^^^^^^^
+// Same — literal union of allowed states.
+```
+
+## 9:00 — Open the admin SPA
+
+If you haven't started it yet, run it in a separate terminal:
+
+```bash
+cd admin && npm install && npm run dev
+```
+
+Browse to `http://localhost:5173`. The admin reads `/_describe` at startup and renders forms, tables, and detail views for every loaded schema. New schemas appear on refresh — no per-resource wiring needed. A contact's detail page auto-discovers a Deals tab from `deal.belongsTo: contact`.
+
+## 10:00 — Done
+
+Here's what you built:
+
+- A REST + GraphQL + MCP CRM with four schemas, deployed to the cloud
+- A state machine on `deal.stage` with structured, agent-readable errors
+- A `lostReason` aggregation Claude added in one prompt
+- A `region` field you added with a one-line schema edit
+- An admin SPA reflecting all of it without per-resource wiring
+- A typed TypeScript client for your frontend
+
+## What to read next
+
+<CardGroup cols={2}>
+  <Card title="Schema-Driven Generation" icon="diagram-project" href="/concepts/schema-driven">
+    The model behind the magic — how one schema file produces every surface.
+  </Card>
+  <Card title="Agent-First Design" icon="robot" href="/concepts/agent-first">
+    Why Claude Code's experience is a first-class part of the framework's design.
+  </Card>
+  <Card title="Tenant Isolation" icon="lock" href="/concepts/tenancy">
+    How `userId` and `accountId` keep User A out of User B's data across every surface.
+  </Card>
+  <Card title="Schema Reference" icon="book" href="/reference/schema">
+    Every option you can declare in a schema file.
+  </Card>
+</CardGroup>

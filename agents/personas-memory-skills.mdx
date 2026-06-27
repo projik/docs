@@ -1,0 +1,271 @@
+---
+title: "Agent Personas, Memory, and Skills Explained"
+sidebarTitle: "Personas & Skills"
+description: "Give your dAvePi agent a brand voice, persistent memory, per-user profiles, and governed runbooks — all backed by tenant-isolated schemas."
+---
+
+A bare `@davepi/agent` is stateless: every turn assembles the same default system prompt and forgets the conversation when the channel hands history back. The **learning layer** is the opt-in feature set that gives an agent a persistent identity, slow-changing memory, governed runbooks, and a per-customer profile shared across the tenant's agents.
+
+Everything in the learning layer is backed by tenant-isolated dAvePi schemas, read and written through the agent's own MCP identity. The JWT remains the access boundary even as the agent gets richer context.
+
+## Turning it on
+
+The entire layer is gated on a single environment variable:
+
+```bash
+AGENT_KEY=support   # or sales, billing-ops, onboarding, etc.
+```
+
+When `AGENT_KEY` is set, the agent reads four rows at session start and folds them into a frozen system-prompt snapshot. When it is unset, no lookups happen and the agent uses the built-in default prompt — useful when you are standing up a new backend and have not authored any rows yet.
+
+## The prompt-slot model
+
+The system prompt is assembled from stable to volatile, so the long stable prefix stays byte-identical across turns and Anthropic prompt caching keeps hitting:
+
+```
+┌─────────────────────────────────────────────────┐
+│ 1. Persona (SOUL)                               │  ┐
+│    identity / style / avoid / defaults          │  │
+├─────────────────────────────────────────────────┤  │
+│ 2. Operating contract (static framing)          │  │  frozen snapshot —
+├─────────────────────────────────────────────────┤  │  byte-stable for the
+│ 3. Skill index (L0)                             │  │  whole session
+│    name + description of approved skills        │  │
+├─────────────────────────────────────────────────┤  │
+│ 4. Agent memory (MEMORY)                        │  │
+├─────────────────────────────────────────────────┤  │
+│ 5. Customer profile (USER)                      │  ┘
+│    preferences + notes                          │
+├═════════════════════════════════════════════════┤  ← Anthropic cache breakpoint
+│ 6. Volatile — history + new turn                │
+└─────────────────────────────────────────────────┘
+```
+
+Slots 1–5 are snapshotted once at session start and **frozen for the whole conversation**. Mid-session writes to persona, memory, or skills hit the database but do not mutate the live prefix — they take effect on the *next* session's snapshot.
+
+<Warning>
+  Treat memory, profiles, and persona as slow-changing background that may be slightly stale — never as live system state. For anything that changes (order status, ticket state, balances), the agent calls a tool to read it fresh. Snapshotted text shapes tone and recall; it is never an access-control mechanism.
+</Warning>
+
+A new session starts when the gap since the last turn exceeds `AGENT_SESSION_IDLE_SECONDS` (default `1800` / 30 minutes). That boundary is also when self-authored writes from the prior session become visible.
+
+## Persona — slot 1
+
+The persona is the agent's identity and brand voice — one row per `(tenant, agentKey)`. It leads the system prompt and is the most stable slot, so changes ripple through every future session.
+
+### Schema fields
+
+| Field | Type | Notes |
+|---|---|---|
+| `agentKey` | String | Which agent this is (`support`, `sales`, etc.). Required, unique per tenant. |
+| `identity` | String | First-person identity. *"You are Ada, the support agent for Acme."* |
+| `style` | String | Tone, length, vocabulary. *"Warm, concise, never more than three sentences."* |
+| `avoid` | String | Hard compliance rules. *"Never promise refund dates or speculate on future features."* |
+| `defaults` | String | Background assumptions. *"Assume the customer is on the Pro plan unless told otherwise."* |
+| `status` | String | `active` or `archived`. Only `active` rows are rendered into the prompt. |
+| `proposedPatch` | String | The one field the agent can write — a free-form proposal for operator review. |
+
+### Authoring a persona
+
+Personas are operator-authored. The agent's service token carries role `['agent']`, and field-level ACL on every live persona field strips agent writes on every surface (REST, GraphQL, MCP). The *only* field an agent can write is `proposedPatch`.
+
+Create the row as the operator:
+
+```js
+await fetch('http://localhost:5050/api/agentPersona', {
+  method: 'POST',
+  headers: {
+    'content-type': 'application/json',
+    authorization: `Bearer ${OPERATOR_JWT}`,
+  },
+  body: JSON.stringify({
+    agentKey: 'support',
+    identity: 'You are Ada, the support agent for Acme.',
+    style: 'Warm and concise. Never more than three sentences. Always offer one concrete next step.',
+    avoid: 'Never promise refund dates. Never speculate about future product features.',
+    defaults: 'Assume the customer is on the Pro plan unless told otherwise.',
+  }),
+});
+```
+
+On the agent's next conversation after this write, the persona leads the prompt and the agent introduces itself as Ada.
+
+### Self-authored proposals
+
+The agent can suggest persona changes by writing to `proposedPatch`. An operator reviews and applies the change:
+
+```js
+// Agent (over MCP):
+update_agentPersona({ id: '...', record: { proposedPatch: 'Soften the refund avoid rule to allow same-day refunds under $20.' } })
+
+// Operator (via dashboard / REST):
+update_agentPersona({ id: '...', record: { avoid: '...new text...', proposedPatch: null } })
+```
+
+## Memory — slot 4
+
+Memory holds the slow-changing facts the agent has learned about how *this tenant* operates — things like *"EU customer base, default to GDPR-safe phrasing"* or *"the Pro plan is the common case"*. One row per `(tenant, agentKey)` with one free-form `body` field.
+
+### Schema fields
+
+| Field | Type | Notes |
+|---|---|---|
+| `agentKey` | String | Which agent this memory belongs to. |
+| `body` | String | Free-form markdown. |
+| `updatedBy` | String | Provenance: `agent` (self-authored) or `operator:<id>` (human-corrected). |
+
+### Self-authoring
+
+Unlike persona, memory is the surface the agent is **meant to write**. There is no operator-only field ACL. The agent updates its memory through the schema-generated MCP tools:
+
+```
+update_agentMemory({
+  id: '<existing row id>',
+  record: { body: '<new full body, including the just-learned fact>' }
+})
+```
+
+Because the frozen snapshot is captured once per session, that write takes effect on the *next* session — consistent with the cache-stable prompt discipline.
+
+### Pre-loading memory
+
+To seed an agent's memory before its first conversation, write the row as the operator:
+
+```js
+await fetch('http://localhost:5050/api/agentMemory', {
+  method: 'POST',
+  headers: {
+    'content-type': 'application/json',
+    authorization: `Bearer ${OPERATOR_JWT}`,
+  },
+  body: JSON.stringify({
+    agentKey: 'support',
+    body: '## Account context\n\n- Customer base is mostly EU. Default to GDPR-safe phrasing.\n- The Pro plan covers 95% of users; assume it unless explicitly told otherwise.',
+  }),
+});
+```
+
+## Customer profile — slot 5
+
+The per-user profile holds preferences and notes the agent accumulates about a **specific end-user** across sessions — things like *"prefers email over phone"* or *"always asks about the EU region first"*. One row per `(tenant, endUserKey)`, where `endUserKey` is channel-prefixed: `slack:U12345`, `http:abc123`.
+
+### Shared across agents
+
+The profile carries **no `agentKey`** — it is keyed by `endUserKey` alone. What the support agent learns about a customer is visible to the sales agent and vice versa. Tenant isolation is still the hard floor: one tenant's profiles cannot be read by another.
+
+### Schema fields
+
+| Field | Type | Notes |
+|---|---|---|
+| `endUserKey` | String | Channel-prefixed: `slack:U12345`. Required, indexed. |
+| `preferences` | String | Free-form JSON or markdown. |
+| `notes` | String | Free-form prose. |
+| `lastSeenAt` | Date | Refreshed on every create or update. |
+| `updatedBy` | String | Same two-layer provenance pattern as memory. |
+
+<Note>
+  `preferences` and `notes` are partly written from end-user input, which makes them a potential injection vector. The prompt assembler runs a sanitizer over this text — stripping control characters and neutralizing role-control phrases — before it enters the prompt. The storage layer holds the raw text; the prompt layer neutralizes it.
+</Note>
+
+## Skills — slot 3
+
+Skills are **procedural memory** — reusable runbooks the agent retrieves and follows. Think *"How we issue a refund"* or *"The steps to triage a shipping complaint"*. They differ from persona (identity) and memory (facts) in that they are *procedures*, surfaced through progressive disclosure so a large library of runbooks does not bloat every prompt.
+
+### Three disclosure tiers
+
+| Tier | What is in the prompt | How it is loaded |
+|---|---|---|
+| L0 | `name` + `description` of all `approved` skills | Slot 3 — always present in the system prompt. |
+| L1 | The full `body` (markdown runbook) | `get_skill` MCP tool, fetched on demand. |
+| L2 | `attachments` (object-storage files) | The file tools, fetched only when the body references one. |
+
+The L0 index gives the model just enough to know a runbook exists and decide to read it. The body is fetched only after the model picks the skill. This is the same "load detail only when selected" discipline the tool router applies to tool schemas, now applied to knowledge.
+
+### Schema fields
+
+| Field | Type | Notes |
+|---|---|---|
+| `agentKey` | String | Which agent owns this skill. Required, indexed. |
+| `name` | String | L0 title. Searchable, weighted above description. |
+| `description` | String | L0 one-liner — what the runbook covers. |
+| `body` | String | L1 — the full markdown procedure. |
+| `attachments` | File | L2 — served by short-lived signed URLs. |
+| `useCount` | Number | Incremented when an approved skill is fetched. Surfaces promotion candidates. |
+| `status` | String | State machine: `draft → approved → deprecated`. `deprecated` is terminal. |
+
+### Writing a skill
+
+Write skill rows as the operator. Skills start as `draft` regardless of what you set — the state machine stamps `draft` on every create as a governance invariant:
+
+```js
+await fetch('http://localhost:5050/api/skill', {
+  method: 'POST',
+  headers: {
+    'content-type': 'application/json',
+    authorization: `Bearer ${OPERATOR_JWT}`,
+  },
+  body: JSON.stringify({
+    agentKey: 'support',
+    name: 'Issue a refund',
+    description: 'Step-by-step procedure for issuing a refund within policy.',
+    body: `## Issue a refund\n\n1. Call \`get_order\` with the order id the customer provided.\n2. Verify \`order.status === "delivered"\` and \`order.createdAt\` is within the 30-day refund window.\n3. If eligible, call \`create_refund\` with the order id and amount.\n4. Confirm the refund reference number to the customer.\n5. If ineligible, explain the policy and offer a store credit if within 60 days.`,
+  }),
+});
+```
+
+Then promote it by transitioning to `approved`:
+
+```js
+await fetch('http://localhost:5050/api/skill/<id>/transition', {
+  method: 'POST',
+  headers: {
+    'content-type': 'application/json',
+    authorization: `Bearer ${OPERATOR_JWT}`,
+  },
+  body: JSON.stringify({ status: 'approved' }),
+});
+```
+
+### Governance
+
+A self-authored runbook cannot reach a live customer unreviewed. Two layers enforce this on every write surface (REST, GraphQL, and MCP):
+
+1. The state machine stamps `draft` on every create. An agent can never author an immediately live skill.
+2. Field-level ACL on `status` (`['user', 'admin']`) strips agent writes — only an operator can transition `draft → approved`.
+
+Because the L0 index only ever lists `approved` skills, a half-baked self-authored runbook stays invisible until a human signs off. The `deprecated` status is terminal — retire old runbooks and author fresh ones rather than re-approving in place.
+
+### The learning loop
+
+When a conversation is marked `resolved`, dAvePi emits a `conversation.resolved` event on the framework's event bus. Pair `davepi-plugin-queue` (BullMQ) with a worker that consumes this event off-thread — the worker runs a fresh extraction agent on the transcript and, when the approach was non-trivial and the outcome positive, proposes a `skill` in `status: draft`. Operators approve via the state machine. Trivial chats produce nothing. Resolving a conversation never blocks the response.
+
+## Multiple agents per tenant
+
+<Accordion title="View the multi-agent identity model">
+
+One tenant runs many agents — `support`, `sales`, `billing-ops`, `onboarding`. Each is a distinct process with its own `AGENT_KEY`, persona row, memory row, and skill set:
+
+```
+┌────────────────┐   ┌────────────────┐   ┌────────────────┐
+│ AGENT_KEY=     │   │ AGENT_KEY=     │   │ AGENT_KEY=     │
+│   support      │   │   sales        │   │   billing      │
+│                │   │                │   │                │
+│ persona row    │   │ persona row    │   │ persona row    │
+│ memory  row    │   │ memory  row    │   │ memory  row    │
+│ skills (N)     │   │ skills (M)     │   │ skills (K)     │
+└────────┬───────┘   └────────┬───────┘   └────────┬───────┘
+         └──────────┬──────────┴──────────┬──────────┘
+                    ▼                     ▼
+         ┌─────────────────────┐ ┌─────────────────────┐
+         │ shared:             │ │ shared:             │
+         │ customerProfile rows│ │ tenant data         │
+         └─────────────────────┘ └─────────────────────┘
+```
+
+- `agentPersona`, `agentMemory`, `skill` — keyed by `(tenant, agentKey)`. Distinct per agent.
+- `customerProfile` — keyed by `(tenant, endUserKey)`. **Shared** across the tenant's agents.
+- `conversation` — keyed by `(tenant, agentKey, channel, conversationId)`. Distinct per agent.
+
+The agent process authenticates as a tenant-owned user whose token carries role `['agent']`. Make sure the user your agent uses for service auth holds role `agent` (not `user` or `admin`), or the field-level ACL gates collapse open.
+
+</Accordion>

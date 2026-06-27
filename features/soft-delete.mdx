@@ -1,0 +1,150 @@
+---
+title: "Protect Records with dAvePi Soft Delete and Restore"
+sidebarTitle: "Soft Delete"
+description: "DELETE stamps a deletedAt tombstone instead of removing rows. Restore with one call, include tombstones with a flag, or auto-purge after N days."
+---
+
+Soft delete is enabled by default on every dAvePi schema. When you call DELETE on a record, the framework sets a `deletedAt` timestamp on the document rather than removing it from the database. All list, get, and relation queries automatically filter out tombstoned records, and you can restore any soft-deleted record with a single API call.
+
+## How It Works
+
+On a soft-delete, the framework:
+
+1. Sets `deletedAt` to the current timestamp on the document.
+2. Returns a success response to the caller.
+3. Writes an audit row with `action: 'delete'`.
+4. Emits a `<resource>.deleted` webhook event.
+
+From that point on, every framework-generated query injects `{ deletedAt: null }` to exclude the record from normal reads. The record remains in MongoDB and can be restored at any time.
+
+## Generated Routes
+
+| Surface | Route / Tool | Description |
+|---------|-------------|-------------|
+| REST | `DELETE /api/v1/:resource/:id` | Stamps `deletedAt`. |
+| REST | `POST /api/v1/:resource/:id/restore` | Clears `deletedAt`. |
+| GraphQL | `<path>RemoveById` | Soft-deletes the record. |
+| GraphQL | `<path>Restore` | Clears the tombstone. |
+| MCP | `delete_<path>` | Soft-deletes. |
+| MCP | `restore_<path>` | Restores. |
+| Typed client | `api.<resource>.delete(id)` | Soft-deletes. |
+| Typed client | `api.<resource>.restore(id)` | Restores. |
+
+## Restore a Deleted Record
+
+Send a POST to the restore route to clear the tombstone:
+
+<CodeGroup>
+
+```http REST
+POST /api/v1/contact/abc123/restore
+Authorization: Bearer <token>
+```
+
+```ts Typed client
+await api.contact.restore('abc123');
+```
+
+```json MCP
+{
+  "name": "restore_contact",
+  "arguments": { "id": "abc123" }
+}
+```
+
+</CodeGroup>
+
+The response is the fully restored record. Restore writes an audit row with `action: 'restore'` and emits a `<resource>.restored` webhook event, symmetrical with the delete operation.
+
+## Include Tombstoned Records in List Queries
+
+By default, list endpoints never return soft-deleted records. Pass `__includeDeleted=true` to opt in:
+
+```http
+GET /api/v1/contact?__includeDeleted=true
+Authorization: Bearer <token>
+```
+
+<Warning>
+`__includeDeleted=true` requires the caller to hold the `delete` role (or `acl.delete` bypass). Standard users cannot enumerate tombstoned records.
+</Warning>
+
+<Note>
+Relations **never** honour `__includeDeleted`. A parent record's soft-deleted children remain invisible regardless of the flag on the parent request. This prevents tombstoned records from leaking through relation traversal.
+</Note>
+
+## Automatic Retention (Auto-Purge)
+
+To permanently remove tombstoned records after a set number of days, configure `softDelete` with a `retentionDays` value:
+
+<Tabs>
+  <Tab title="Per-schema">
+    ```js
+    module.exports = {
+      path: 'contact',
+      softDelete: { retentionDays: 30 },
+      fields: [/* ... */],
+    };
+    ```
+  </Tab>
+  <Tab title="Global (env)">
+    ```bash
+    SOFT_DELETE_RETENTION_DAYS=30
+    ```
+
+    Applies to all schemas that do not override `softDelete` explicitly.
+  </Tab>
+</Tabs>
+
+A background sweep hard-deletes any tombstoned row older than the configured retention window. Associated file blobs are removed from storage at the same time.
+
+## Hard Delete (Opt Out)
+
+If you have no need to recover deleted records — session tokens, idempotency rows with their own TTL, ephemeral caches — disable soft delete entirely:
+
+```js
+module.exports = {
+  path: 'session_token',
+  softDelete: false,
+  fields: [/* ... */],
+};
+```
+
+When `softDelete: false`:
+
+- No `deletedAt` field is added to documents.
+- DELETE removes the row immediately and permanently.
+- The `restore` route, GraphQL mutation, and MCP tool are not generated.
+- `__includeDeleted` is a no-op.
+
+## Cross-Tenant Delete Bypass
+
+By default, DELETE is owner-only — a user can only soft-delete records they own. Grant additional roles the ability to delete any record with `acl.delete`:
+
+```js
+module.exports = {
+  path: 'contact',
+  acl: { delete: ['admin'] },
+  fields: [/* ... */],
+};
+```
+
+Roles listed in `acl.delete` bypass the `userId` filter on both DELETE and restore operations, matching the same posture as `acl.list`.
+
+<Steps>
+  <Step title="User calls DELETE">
+    The framework checks if the caller owns the record or holds an `acl.delete` role.
+  </Step>
+  <Step title="Tombstone is written">
+    `deletedAt` is set to the current timestamp. The record is hidden from normal queries immediately.
+  </Step>
+  <Step title="Audit row written">
+    An audit entry with `action: 'delete'` is written to `audit_log`. The `before` snapshot captures the record's state at deletion time.
+  </Step>
+  <Step title="Restore (optional)">
+    Call `POST /:id/restore` to clear `deletedAt` and make the record visible again. A symmetric audit row with `action: 'restore'` is written.
+  </Step>
+  <Step title="Auto-purge (optional)">
+    If `retentionDays` is set, the sweep job permanently removes the tombstone and its file blobs after the configured window expires.
+  </Step>
+</Steps>

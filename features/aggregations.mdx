@@ -1,0 +1,266 @@
+---
+title: "Declarative Aggregation Pipelines on dAvePi Schemas"
+sidebarTitle: "Aggregations"
+description: "Declare MongoDB aggregation pipelines on your schema and get REST, GraphQL, MCP, and typed-client surfaces automatically — with tenant isolation built in."
+---
+
+Schemas can declare aggregation pipelines that the framework surfaces as a REST route, a GraphQL query, an MCP tool, and a typed client method — all from the same source-of-truth declaration. The aggregation runner prepends `$match: { userId }` automatically, so even the most freeform pipeline cannot return cross-tenant rows.
+
+## Declaring an aggregation
+
+Add an `aggregations` array to your schema's top-level export:
+
+```js
+module.exports = {
+  path: 'deal',
+  fields: [/* ... */],
+  aggregations: [
+    {
+      name:        'countByStage',
+      description: 'Deal count grouped by stage for the authenticated user.',
+      pipeline: [
+        { $group: { _id: '$stage', count: { $sum: 1 } } },
+        { $sort:  { count: -1 } },
+      ],
+    },
+  ],
+};
+```
+
+This single declaration generates:
+
+<CardGroup cols={2}>
+  <Card title="REST" icon="globe">
+    `GET /api/v1/deal/aggregations/countByStage`
+  </Card>
+  <Card title="GraphQL" icon="circle-nodes">
+    `dealCountByStage` query
+  </Card>
+  <Card title="MCP" icon="robot">
+    `aggregate_deal_countByStage` tool
+  </Card>
+  <Card title="Typed client" icon="code">
+    `api.deal.countByStage()`
+  </Card>
+</CardGroup>
+
+Every aggregation also appears in `_describe` so agents can plan against it without reading source code.
+
+## Tenant isolation is non-bypassable
+
+The runner prepends `{ $match: { userId: req.user.user_id } }` as the first stage of every aggregation, before any stage you write. Even if your pipeline starts with `{ $match: {} }`, the framework's tenant stage runs first:
+
+```js
+pipeline: [
+  // ↑ Framework injects { $match: { userId } } here, ahead of you.
+  { $group: { _id: '$stage', count: { $sum: 1 } } },
+],
+```
+
+Write the business logic. Tenancy is structural.
+
+## Adding parameters
+
+Declare `params` to accept caller-supplied values that filter the pipeline:
+
+```js
+aggregations: [
+  {
+    name:        'wonByMonth',
+    description: 'Won deal count by month, optionally filtered to a date range.',
+    params: [
+      {
+        name:     'since',
+        type:     'date',
+        required: true,
+        match:    { closedAt: { $gte: ':since' } },
+      },
+      {
+        name:  'until',
+        type:  'date',
+        match: { closedAt: { $lte: ':until' } },
+      },
+    ],
+    pipeline: [
+      { $match: { stage: 'won' } },
+      { $group: {
+          _id:   { $dateToString: { format: '%Y-%m', date: '$closedAt' } },
+          count: { $sum: 1 },
+      } },
+      { $sort: { _id: 1 } },
+    ],
+  },
+],
+```
+
+Each param with a `match` key becomes its own `$match` stage in the compiled pipeline, ordered after the tenant scope and before your hand-written pipeline. The `:paramName` placeholder in `match` values is replaced with the parsed, type-cast value.
+
+<ParamField query="name" type="string" required>
+  Argument name on the URL, GraphQL query, and MCP tool.
+</ParamField>
+
+<ParamField query="type" type="string" required>
+  One of `string`, `number`, `date`, `boolean`, or `objectId`. The framework parses and validates the wire value into the typed form.
+</ParamField>
+
+<ParamField query="required" type="boolean">
+  When `true`, the server returns `400` if the caller omits the param.
+</ParamField>
+
+<ParamField query="default" type="any">
+  Default value applied when the caller omits a non-required param.
+</ParamField>
+
+<ParamField query="match" type="object">
+  A MongoDB predicate pasted into a `$match` stage. Use `:paramName` as a placeholder for the cast value.
+</ParamField>
+
+## Calling aggregations
+
+<Tabs>
+  <Tab title="REST">
+    ```http
+    GET /api/v1/deal/aggregations/wonByMonth?since=2026-01-01
+    Authorization: Bearer <token>
+
+    200 OK
+    {
+      "results": [
+        { "_id": "2026-01", "count": 3 },
+        { "_id": "2026-02", "count": 7 }
+      ]
+    }
+    ```
+  </Tab>
+  <Tab title="GraphQL">
+    ```graphql
+    {
+      dealWonByMonth(since: "2026-01-01") {
+        _id
+        count
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="MCP">
+    ```json
+    {
+      "name": "aggregate_deal_wonByMonth",
+      "arguments": { "since": "2026-01-01" }
+    }
+    ```
+  </Tab>
+  <Tab title="Typed client">
+    ```ts
+    const rows = await api.deal.wonByMonth({ since: '2026-01-01' });
+    // rows is typed based on the inferred pipeline output
+    ```
+  </Tab>
+</Tabs>
+
+## Caching
+
+Add a `cache` block to avoid re-running an expensive pipeline on every dashboard refresh:
+
+```js
+aggregations: [
+  {
+    name:  'countByStage',
+    cache: { ttlSeconds: 30 },
+    pipeline: [/* ... */],
+  },
+],
+```
+
+The cache is in-process and per-tenant — the cache key includes `userId` so tenants never share results. The framework automatically purges a tenant's cache entry when any record on the schema is created, updated, or deleted, so a newly-won deal immediately moves the dashboard counter.
+
+<Note>
+  The in-process cache is a hot-path optimization for dashboards. It is not a substitute for materialized views. Drop the `cache` key when you need strict freshness.
+</Note>
+
+## Cross-tenant aggregations for operators
+
+If an admin role legitimately needs to aggregate across all tenants, set `unsafe: true` and pair it with the schema's `acl.list` slot:
+
+```js
+acl: { list: ['admin'] },
+aggregations: [
+  {
+    name:        'platformWonByMonth',
+    description: 'Platform-wide won deal count — admin only.',
+    unsafe:      true,
+    pipeline: [
+      { $match: { stage: 'won' } },
+      { $group: {
+          _id:   { $dateToString: { format: '%Y-%m', date: '$closedAt' } },
+          count: { $sum: 1 },
+      } },
+    ],
+  },
+],
+```
+
+`unsafe: true` skips the auto-injected `{ $match: { userId } }`. Callers without a role listed in `acl.list` receive `403 FORBIDDEN`.
+
+<Warning>
+  Use `unsafe: true` sparingly. Any aggregation that skips tenant scoping must be protected by `acl.list` — otherwise it leaks cross-tenant data to any authenticated caller.
+</Warning>
+
+## Forbidden operators
+
+The framework rejects pipelines that contain these operators (defense-in-depth, checked on every request):
+
+| Forbidden | Reason |
+|-----------|--------|
+| `$out` | Writes to a collection. |
+| `$merge` | Writes to a collection. |
+| `$lookup` | Cross-collection join. |
+| `$graphLookup` | Cross-collection graph traversal. |
+| `$unionWith` | Cross-collection union. |
+| `$function` | Arbitrary JavaScript execution. |
+| `$accumulator` | Arbitrary JavaScript accumulation. |
+
+Pass `unsafe: true` on the aggregation declaration to opt in to any of these. The opt-in is explicit and still subject to `acl.list` enforcement.
+
+## Example: count deals by stage and revenue by month
+
+```js
+aggregations: [
+  {
+    name:        'countByStage',
+    description: 'Deal count grouped by pipeline stage.',
+    cache: { ttlSeconds: 60 },
+    pipeline: [
+      { $group: { _id: '$stage', count: { $sum: 1 } } },
+      { $sort:  { count: -1 } },
+    ],
+  },
+  {
+    name:        'revenueByMonth',
+    description: 'Total closed revenue grouped by calendar month.',
+    params: [
+      {
+        name:     'since',
+        type:     'date',
+        required: true,
+        match:    { closedAt: { $gte: ':since' } },
+      },
+    ],
+    pipeline: [
+      { $match: { stage: 'won' } },
+      { $group: {
+          _id:     { $dateToString: { format: '%Y-%m', date: '$closedAt' } },
+          revenue: { $sum: '$value' },
+          count:   { $sum: 1 },
+      } },
+      { $sort: { _id: 1 } },
+    ],
+  },
+],
+```
+
+## See also
+
+- [Schema file shape](/reference/schema#aggregations) — full top-level syntax reference.
+- [Tenant isolation](/concepts/tenancy) — why the `$match: { userId }` stage matters.
+- [ACL](/features/acl) — `acl.list` and the `unsafe` opt-in for cross-tenant operators.

@@ -1,0 +1,117 @@
+---
+title: "API Stability Commitments and Deprecation Policy"
+sidebarTitle: "Stability"
+description: "What dAvePi guarantees about backwards compatibility — semver rules, the deprecation window, stable vs. internal surfaces, and the changelog."
+---
+
+dAvePi follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from v1.0.0 onward. This page tells you exactly which APIs are covered by that promise, what "covered" means in practice, and what to expect before anything breaking ships.
+
+## What version numbers mean
+
+| Bump | What it signals |
+|------|-----------------|
+| **Major** (`1.x.x` → `2.0.0`) | A breaking change to a stable API. |
+| **Minor** (`1.0.x` → `1.1.0`) | A backwards-compatible new feature on a stable API. |
+| **Patch** (`1.0.0` → `1.0.1`) | A backwards-compatible bug fix or security patch. |
+
+Pin to `^1.0.0` and you get every minor and patch release — new features and fixes — while your application keeps working until you choose to upgrade across a major boundary.
+
+## What is stable
+
+These surfaces are covered by the semver promise. A breaking change to any of them requires a major version bump, and the previous behaviour stays available through at least one full minor release under a deprecation notice.
+
+<CardGroup cols={2}>
+  <Card title="Schema file vocabulary" icon="file-code">
+    Every key in a schema file's top-level object (`path`, `collection`, `fields`, `relations`, `aggregations`, `compositeIndex`, `softDelete`, `audit`, `acl`, `webhooks`, `hooks`, `version`) and every key inside a `fields[]` entry. See [Schema File](/reference/schema) and [Field Options](/reference/fields).
+  </Card>
+  <Card title="REST API surface" icon="arrow-right-arrow-left">
+    Auto-generated routes per schema, request/response shapes, and query parameter conventions (`__page`, `__sort`, `__perPage`, `__include`, `__includeDeleted`, mongo-querystring filters, `q`).
+  </Card>
+  <Card title="GraphQL surface" icon="circle-nodes">
+    Resolver naming (`<path>Many`, `<path>ById`, `<path>UpdateById`, `<path>Transition<Field>`, etc.) and input type shapes (`<Path>Input`, `<Path>UpdateInput`, `<Path>FilterInput`).
+  </Card>
+  <Card title="MCP tool surface" icon="robot">
+    Tool naming (`list_<path>`, `create_<path>`, `update_<path>`, `delete_<path>`, `aggregate_<path>_<name>`, `list_<path>_<rel>`, `upload_<path>_<file>`, etc.) and all tool argument schemas.
+  </Card>
+  <Card title="Error envelope" icon="triangle-exclamation">
+    The `{ error: { code, message, details? } }` shape and the full typed-error catalogue in [Errors](/reference/errors). The `code` value is contractual; `message` text may change without a major bump.
+  </Card>
+  <Card title="CLI commands" icon="terminal">
+    `davepi gen-client`, `davepi migrate up/down/status` — flags and exit-code semantics are stable.
+  </Card>
+  <Card title="_describe manifest" icon="list">
+    Top-level `version`, `schemas`, `auth`, `features` keys and the per-schema metadata shape. Additive changes are minor; removed keys require a major.
+  </Card>
+  <Card title="Auth and token shape" icon="key">
+    `/login` and `/register` request/response bodies, and JWT claim names (`user_id`, `email`, `roles`).
+  </Card>
+</CardGroup>
+
+<Note>
+  The `/_metrics` endpoint shape and metric names (`http_requests_total`, `http_request_duration_seconds`) are also stable as of v1.0.0. See [Observability](/operations/observability).
+</Note>
+
+## What is experimental
+
+These surfaces are marked as experimental when introduced. Their shape or behaviour can change in a minor release — with a deprecation note in the CHANGELOG, but without a major bump.
+
+- New schema options shipped behind a feature flag.
+- `aggregations.unsafe: true` semantics — currently stable, but the set of `acl` slots that grant access may evolve.
+- Admin SPA layout, theme, and preview features. The data flow powering the SPA is stable; the UI itself is not.
+
+When a feature page says "experimental," it is not covered by semver yet.
+
+## What is internal (not covered)
+
+Changes to these can ship in any release without a deprecation window. Do not build on them:
+
+<Accordion title="Private utility helpers">
+  `utils/schemaLoader`, `utils/scopeResolver`, `utils/mcpServer`, and similar framework internals are not part of the public API. The features they expose through the stable surfaces above are covered; the helpers themselves are not. Do not `require` them directly from application code.
+</Accordion>
+
+<Accordion title="MongoDB storage layout">
+  Collection names, document shapes, and index choices are implementation details. Read and write through REST, GraphQL, or MCP — not through direct MongoDB queries against the framework's collections.
+</Accordion>
+
+<Accordion title="Log line formats">
+  Pino field names and severity labels can change. Do not grep production logs for specific phrases as a monitoring hook — use structured queries on the JSON output or wire an APM tool that parses the JSON.
+</Accordion>
+
+<Accordion title="Admin SPA asset paths">
+  Bundle hashes and file paths inside `node_modules` for the bundled admin SPA are not stable. Point at the published route path, not at internal asset files.
+</Accordion>
+
+## Deprecation policy
+
+When a stable API is scheduled to change in a future major version, the following process applies:
+
+<Steps>
+  <Step title="Mark it deprecated in a minor release">
+    The runtime emits a warning: a `Deprecation` HTTP response header, a `console.warn` from the CLI, an `extensions.deprecated` flag on GraphQL responses. The `_describe` manifest carries `deprecated: true` for the affected schema element. The CHANGELOG entry calls it out explicitly.
+  </Step>
+  <Step title="Keep the old behaviour working">
+    The deprecated API remains fully functional for at least one complete minor release — often longer. You have a real migration window before anything breaks.
+  </Step>
+  <Step title="Remove in the next major">
+    The removal ships in the next major version. The CHANGELOG explicitly lists every removed API. By the time the major drops, every removal has been deprecated for at least one release line and documented with migration guidance.
+  </Step>
+</Steps>
+
+Migrating between majors should never be a surprise.
+
+## What "stable" does not mean
+
+- **Bug fixes can change observable behaviour.** A patch that makes `INVALID_TRANSITION` return the correct `allowed` array is not a breaking change, even if code that relied on the buggy empty array breaks. Behaviour changes are noted in the CHANGELOG.
+- **Performance is not part of the contract.** A response that took 50 ms may take 30 ms or 80 ms across versions.
+- **Unsorted list order is not guaranteed.** If you do not pass `__sort`, document order can change across versions.
+- **Internal log content is not contractual.** Adding a field to a log JSON line is not a breaking change.
+
+## Reporting a contract regression
+
+If a minor or patch release breaks one of the stable APIs listed above, that is a bug. Open an issue on [GitHub](https://github.com/projik/davepi/issues) and the team will treat it as a regression to fix in the next patch release.
+
+## See also
+
+- [CHANGELOG](https://github.com/projik/davepi/blob/main/CHANGELOG.md) — every release's additions, changes, and removals.
+- [SECURITY.md](https://github.com/projik/davepi/blob/main/SECURITY.md) — the disclosure process and which versions receive security fixes.
+- [Errors](/reference/errors) — the typed error code catalogue (codes are stable).

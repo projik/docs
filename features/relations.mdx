@@ -1,0 +1,179 @@
+---
+title: "Declaring Relations Between dAvePi Schemas"
+sidebarTitle: "Relations"
+description: "Link schemas with belongsTo, hasOne, and hasMany relations and populate them at read time via __include — tenant-scoped and ACL-filtered automatically."
+---
+
+A `relations` map tells the framework how your schemas connect. Declare the map once on a schema and the framework handles the rest: batched population at read time, tenant scoping re-applied on every traversal, ACL projection on each populated record, per-relation MCP tools, and typed client accessors. You never write join logic by hand.
+
+## Declaring relations
+
+Add a `relations` key to your schema's top-level export:
+
+```js
+// schema/versions/v1/account.js
+module.exports = {
+  path: 'account',
+  fields: [
+    { name: 'userId', type: String, required: true },
+    { name: 'name',   type: String, required: true },
+  ],
+  relations: {
+    contacts: {
+      hasMany: 'contact',
+      fk:      'accountId',
+    },
+    primaryContact: {
+      hasOne: 'contact',
+      fk:     'accountId',
+      where:  { isPrimary: true },
+    },
+  },
+};
+```
+
+```js
+// schema/versions/v1/contact.js
+module.exports = {
+  path: 'contact',
+  fields: [
+    { name: 'userId',    type: String,  required: true },
+    { name: 'accountId', type: String,  required: true },
+    { name: 'name',      type: String,  required: true },
+    { name: 'isPrimary', type: Boolean, default: false },
+  ],
+  relations: {
+    account: {
+      belongsTo: 'account',
+      fk:        'accountId',
+    },
+  },
+};
+```
+
+## Relation types
+
+| Kind | What it means | Where the FK lives |
+|------|---------------|--------------------|
+| `belongsTo` | This schema points at one record in the target. | On **this** schema. |
+| `hasOne` | The target schema has exactly one matching record. | On the **target**. |
+| `hasMany` | The target schema has multiple matching records. | On the **target**. |
+
+<ParamField body="hasMany / hasOne / belongsTo" type="string" required>
+  The `path` of the target schema.
+</ParamField>
+
+<ParamField body="fk" type="string">
+  The foreign-key field name. Defaults to `<targetPath>Id` — e.g. `accountId` for a relation targeting `account`.
+</ParamField>
+
+<ParamField body="where" type="object">
+  An optional extra filter applied to the target query. Useful for `hasOne` to select "the primary one" among many candidates.
+</ParamField>
+
+## Populating relations at read time
+
+### REST — `__include`
+
+Add `__include` to any `GET` request with a comma-separated list of relation names:
+
+```http
+GET /api/v1/account/abc?__include=contacts,primaryContact
+Authorization: Bearer <token>
+```
+
+Response:
+
+```json
+{
+  "_id":  "abc",
+  "name": "Acme",
+  "contacts": [
+    { "_id": "x", "name": "Jane", "accountId": "abc" },
+    { "_id": "y", "name": "Bob",  "accountId": "abc" }
+  ],
+  "primaryContact": { "_id": "x", "name": "Jane", "isPrimary": true }
+}
+```
+
+### GraphQL
+
+The same relations surface as nested fields:
+
+```graphql
+{
+  accountById(_id: "abc") {
+    name
+    contacts       { _id name }
+    primaryContact { _id name }
+  }
+}
+```
+
+### MCP
+
+Per-relation tools are generated automatically:
+
+| Relation kind | Generated tool |
+|---------------|---------------|
+| `belongsTo` / `hasOne` | `get_<path>_<relation>(id)` — returns the single populated record (or `null`). |
+| `hasMany` | `list_<path>_<relation>(id, filter?, sort?)` — returns the populated children for that parent. |
+
+For example, the `account` schema above gets `list_account_contacts` and `get_account_primaryContact`.
+
+### Typed client
+
+```ts
+// Populate via include option
+const account = await api.account.get('abc', { include: ['contacts'] });
+// account.contacts is typed as Contact[]
+
+// Or use the per-relation shorthand
+const contacts = await api.account.contacts('abc');
+```
+
+The `<Resource>Include` type is a literal union — `'contacts' | 'primaryContact'` — so the compiler catches misspelled relation names.
+
+## Batching: O(1) queries per relation
+
+The engine collects all parent IDs in the current response, issues one `find` per relation, then bucket-maps the children back to their parents. A list of 100 accounts with `?__include=contacts` costs exactly two queries — one for `account`, one for `contact` — regardless of how many accounts are returned.
+
+## Tenant isolation on every hop
+
+Every related query re-applies `userId: req.user.user_id` against the target collection, even though the parent's tenancy was already verified at the top of the request. This prevents a tampered FK on the parent document from leaking another tenant's data.
+
+<Note>
+  Tenant scoping is re-applied on **every** relation traversal. You never need to add `userId` filters to your `where` clauses.
+</Note>
+
+## ACL projection on populated records
+
+Each populated record runs through the target schema's ACL projector. A user who can read `account` but lacks the `admin` role cannot see `contact.privateNotes` — it is stripped from the populated results, not leaked sideways through `__include`.
+
+## Soft-delete tombstones
+
+Tombstones are filtered out of relation results regardless of the parent request's `__includeDeleted` flag. Deleted records do not appear in `hasMany` or `hasOne` results.
+
+## Depth cap
+
+Nested includes — e.g. `?__include=tasks.subtasks` — are not supported in v1. Each `__include` is one hop. Combine multiple top-level includes to get breadth:
+
+```http
+GET /api/v1/project/abc?__include=tasks,members,owner
+```
+
+## Legacy: `field.reference`
+
+The older shorthand still works and is preserved as a synthetic `belongsTo`:
+
+```js
+{ name: 'accountId', type: String, reference: 'account' }
+```
+
+New schemas should declare a `relations` map instead — it gives you named accessors, `hasMany` / `hasOne` support, `where` filters, and auto-generated MCP tools.
+
+## See also
+
+- [Schema file shape](/reference/schema#relations) — top-level relation syntax reference.
+- [Tenant isolation](/concepts/tenancy) — why each related query re-applies `userId`.
+- [ACL](/features/acl) — projection on populated records.

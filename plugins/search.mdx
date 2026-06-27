@@ -1,0 +1,205 @@
+---
+title: "Search Plugin — Typesense, Meilisearch & Algolia"
+sidebarTitle: "Search"
+description: "Add typo-tolerant full-text search to any dAvePi schema. Auto-indexes records on every mutation and exposes tenant-scoped REST and GraphQL surfaces."
+---
+
+`davepi-plugin-search` adds full-text search to any schema that opts in with a `search` block. The plugin builds the backend index at boot, keeps it in sync by subscribing to the record event bus, and exposes tenant-scoped REST and GraphQL search endpoints — no route code to write. Choose between Typesense, Meilisearch, or Algolia as the backend. The plugin stays dormant until `SEARCH_API_KEY` is set.
+
+## Install
+
+```bash
+npm install davepi-plugin-search
+```
+
+```json
+{
+  "davepi": {
+    "plugins": ["davepi-plugin-search"]
+  }
+}
+```
+
+## Opt a schema in
+
+Add a `search` block to any schema file. Schemas without a `search` block are untouched:
+
+```js
+// schema/versions/v1/product.js
+module.exports = {
+  path: 'product',
+  collection: 'product',
+  fields: [
+    { name: 'userId',      type: 'String',   required: true },
+    { name: 'title',       type: 'String' },
+    { name: 'description', type: 'String' },
+    { name: 'tags',        type: ['String'] },
+    { name: 'category',    type: 'String' },
+    { name: 'inStock',     type: 'Boolean' },
+  ],
+  search: {
+    fields: [
+      { name: 'title', weight: 3 },  // higher weight = ranks higher
+      { name: 'description' },        // bare string == weight 1
+      'tags',
+    ],
+    facets:       ['category', 'inStock'],
+    sortDefaults: ['createdAt:desc'],
+  },
+};
+```
+
+Only the declared `search.fields` and `facets` are sent to the search backend — the projection step keeps index size manageable and avoids indexing sensitive fields.
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `SEARCH_BACKEND` | no | `typesense` | One of `typesense` / `meilisearch` / `algolia`. |
+| `SEARCH_API_URL` | yes for Typesense/Meilisearch | — | Server URL, e.g. `http://localhost:8108`. |
+| `SEARCH_API_KEY` | yes (else dormant) | — | Admin API key used for indexing. |
+| `SEARCH_PUBLIC_KEY` | no | falls back to `SEARCH_API_KEY` | Restricted key used to mint per-request scoped search keys (Typesense / Algolia). |
+| `ALGOLIA_APP_ID` | yes for Algolia | — | Algolia application ID. |
+| `SEARCH_INDEX_PREFIX` | no | `davepi` | Index name prefix, e.g. `davepi_product`. |
+| `SEARCH_SYNC_DEBOUNCE_MS` | no | `0` | If > 0, batches index upserts within this window (helps under heavy write load). |
+
+## Backend setup
+
+<Tabs>
+  <Tab title="Typesense">
+
+Typesense is the default backend — modern, fast, self-hostable, and free.
+
+```yaml
+# docker-compose.yml
+services:
+  typesense:
+    image: typesense/typesense:27.1
+    ports: ["8108:8108"]
+    command: --data-dir /data --api-key=xyz --enable-cors
+    volumes: ["typesense-data:/data"]
+volumes:
+  typesense-data: {}
+```
+
+```bash
+SEARCH_BACKEND=typesense
+SEARCH_API_URL=http://localhost:8108
+SEARCH_API_KEY=xyz
+```
+
+  </Tab>
+  <Tab title="Meilisearch">
+
+Meilisearch is self-hostable and free.
+
+```yaml
+# docker-compose.yml
+services:
+  meilisearch:
+    image: getmeili/meilisearch:v1.10
+    ports: ["7700:7700"]
+    environment:
+      MEILI_MASTER_KEY: masterKey
+    volumes: ["meili-data:/meili_data"]
+volumes:
+  meili-data: {}
+```
+
+```bash
+SEARCH_BACKEND=meilisearch
+SEARCH_API_URL=http://localhost:7700
+SEARCH_API_KEY=masterKey
+```
+
+  </Tab>
+  <Tab title="Algolia">
+
+Algolia is a hosted service with a small free tier. Sign up at [algolia.com](https://www.algolia.com), create an app, and grab your credentials from *Dashboard → Settings → API Keys*.
+
+```bash
+SEARCH_BACKEND=algolia
+ALGOLIA_APP_ID=YourAppId
+SEARCH_API_KEY=YourAdminApiKey
+SEARCH_PUBLIC_KEY=YourSearchOnlyApiKey   # optional, for scoped client keys
+```
+
+  </Tab>
+</Tabs>
+
+## Use the search surface
+
+Both the REST endpoint and the GraphQL query are added automatically for every schema with a `search` block. No route code needed.
+
+### REST
+
+```bash
+GET /api/v1/product/search?q=red+shoes&facet=category&filter=inStock:true
+```
+
+```json
+{
+  "hits": [
+    { "_id": "…", "title": "Red running shoes", "score": 99 }
+  ],
+  "facets": {
+    "category": [{ "value": "footwear", "count": 12 }]
+  },
+  "found": 12
+}
+```
+
+### GraphQL
+
+```graphql
+query {
+  productSearch(q: "red shoes", facet: ["category"], filter: "inStock:true") {
+    hits
+    facets
+    found
+  }
+}
+```
+
+The response shape matches a standard dAvePi list response, so your existing pagination and display components work without changes.
+
+## Tenant safety
+
+Every search request receives a `userId:{caller}` predicate injected server-side from the caller's JWT, API key, or client ID. This predicate is mandatory and cannot be widened via the `filter` query parameter — a caller can never read another tenant's records, even if they construct a filter that would otherwise match them.
+
+<Warning>
+Do not include sensitive fields in your schema's `search.fields` or `facets`. Only the fields you declare are indexed, but once indexed they are searchable. Keep passwords, tokens, and PII out of the search block.
+</Warning>
+
+## Backfill and recovery
+
+Declare `search` on an existing schema, recover from a backend outage, or catch up after bulk writes (bulk paths don't emit per-record events):
+
+```bash
+npx davepi-plugin-search reindex product
+```
+
+The plugin also detects a changed `search` config by hashing it. A mismatch at boot re-asserts the index settings and triggers an automatic backfill (with a warning logged).
+
+## Scoped search keys
+
+When `SEARCH_PUBLIC_KEY` is set, `POST /api/v1/{path}/search/token` returns a tenant-scoped, search-only key the browser client can use to talk to the search backend directly, bypassing your API server for read-heavy search traffic. Supported for Typesense and Algolia; Meilisearch returns a clear error on this endpoint in v1.
+
+## Programmatic query
+
+For advanced cross-schema queries or server-side search from lifecycle hooks:
+
+```js
+const search = require('davepi-plugin-search');
+
+const result = await search.query({
+  resource: 'product',
+  q:        'red shoes',
+  user:     req.user,
+});
+// result = { hits: [...], facets: {...}, found: N }
+```
+
+<Tip>
+Default to Typesense or Meilisearch unless you specifically need Algolia's hosted service — both are free, self-hostable, and have feature parity with Algolia for most use cases. Algolia charges beyond its small free tier.
+</Tip>

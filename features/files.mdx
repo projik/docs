@@ -1,0 +1,188 @@
+---
+title: "Store and Serve File Uploads with dAvePi File Fields"
+sidebarTitle: "File Uploads"
+description: "Declare a File field in your schema to get upload, fetch, and delete routes for any storage backend — local, S3, R2, GCS, or MinIO."
+---
+
+dAvePi treats file uploads as a first-class schema concern. Declare a field with `type: 'File'` and the framework generates a dedicated multipart upload route, a fetch route that returns metadata and a URL, and a delete route — plus matching MCP tools and typed client methods. The uploaded blob lives in your chosen storage backend; the stored value on the record is a `FileMeta` sub-document.
+
+## Declare a File Field
+
+Add a field with `type: 'File'` and a `file` configuration object to your schema:
+
+```js
+{
+  name: 'avatar',
+  type: 'File',
+  file: {
+    maxBytes:   5 * 1024 * 1024,          // 5 MB
+    accept:     ['image/jpeg', 'image/png'],
+    storage:    'local',                   // or 's3'
+    visibility: 'private',                 // 'public' for stable CDN URLs
+  },
+}
+```
+
+<ParamField path="maxBytes" type="number">
+  Hard upload limit in bytes. Defaults to 10 MB. Uploads exceeding this limit are rejected before any storage write.
+</ParamField>
+
+<ParamField path="accept" type="string[]">
+  Array of allowed MIME types (e.g. `['image/png', 'image/jpeg']`). The server validates the wire-level content type and re-checks it after the storage write to prevent MIME spoofing.
+</ParamField>
+
+<ParamField path="storage" type="string">
+  Storage backend: `'local'` (default — writes to `UPLOADS_DIR` on disk) or `'s3'`. Use a plugin for R2, GCS, or MinIO.
+</ParamField>
+
+<ParamField path="visibility" type="string">
+  `'public'` returns a stable URL on every read. `'private'` (default) omits the URL from stored metadata; clients must call the fetch route to receive a short-lived signed URL.
+</ParamField>
+
+## Generated Routes
+
+Every `File` field generates three routes automatically:
+
+| Action | Method & Path | MCP Tool | Typed Client |
+|--------|--------------|----------|--------------|
+| Upload | `POST /api/v1/:resource/:id/:field` (multipart/form-data) | `upload_<path>_<field>` | `api.<resource>.upload<Field>(id, blob)` |
+| Fetch metadata + URL | `GET /api/v1/:resource/:id/:field` | `fetch_<path>_<field>` | `api.<resource>.fetch<Field>Url(id)` |
+| Delete | `DELETE /api/v1/:resource/:id/:field` | `delete_<path>_<field>` | `api.<resource>.delete<Field>(id)` |
+
+## Upload a File
+
+Send a `multipart/form-data` POST to the upload route:
+
+<CodeGroup>
+
+```http REST
+POST /api/v1/contact/abc123/avatar
+Authorization: Bearer <token>
+Content-Type: multipart/form-data; boundary=----FormBoundary
+
+------FormBoundary
+Content-Disposition: form-data; name="file"; filename="photo.jpg"
+Content-Type: image/jpeg
+
+<binary data>
+------FormBoundary--
+```
+
+```ts Typed client
+await api.contact.uploadAvatar('abc123', fileBlob);
+```
+
+</CodeGroup>
+
+## Fetch Metadata and URL
+
+<CodeGroup>
+
+```http REST
+GET /api/v1/contact/abc123/avatar
+Authorization: Bearer <token>
+```
+
+```ts Typed client
+const url = await api.contact.fetchAvatarUrl('abc123');
+```
+
+</CodeGroup>
+
+The response includes a `FileMeta` sub-document:
+
+```json
+{
+  "key":          "abc123/avatar/8f3d...png",
+  "size":         12345,
+  "contentType":  "image/png",
+  "originalName": "photo.jpg",
+  "uploadedAt":   "2026-05-10T12:00:00Z",
+  "url":          "https://cdn.example.com/abc123/avatar/8f3d...png"
+}
+```
+
+<Note>
+The `url` field is present only for `visibility: 'public'` files. For `'private'` files, `url` is absent on the stored record. Call the fetch route to receive a short-lived signed URL valid for approximately 5 minutes.
+</Note>
+
+## Delete a File
+
+<CodeGroup>
+
+```http REST
+DELETE /api/v1/contact/abc123/avatar
+Authorization: Bearer <token>
+```
+
+```ts Typed client
+await api.contact.deleteAvatar('abc123');
+```
+
+</CodeGroup>
+
+## Storage Backends
+
+<Tabs>
+  <Tab title="Local (dev)">
+    Files are written to a directory on disk. Configure the path with the `UPLOADS_DIR` environment variable (defaults to `./uploads`).
+
+    ```bash
+    UPLOADS_DIR=/var/data/uploads
+    ```
+
+    Use local storage for development and testing only. It does not replicate across instances.
+  </Tab>
+  <Tab title="S3">
+    Files are stored in an AWS S3 bucket. Set the following environment variables:
+
+    ```bash
+    STORAGE_S3_BUCKET=my-bucket
+    STORAGE_S3_REGION=us-east-1
+    # Standard AWS credentials chain (env, instance profile, etc.)
+    AWS_ACCESS_KEY_ID=...
+    AWS_SECRET_ACCESS_KEY=...
+    ```
+  </Tab>
+  <Tab title="R2 / GCS / MinIO">
+    Cloudflare R2, Google Cloud Storage, and MinIO are available via plugins. Each plugin maps the same `storage` key to the respective provider's SDK.
+  </Tab>
+</Tabs>
+
+## Public vs Private Visibility
+
+| Visibility | `url` behaviour | When to use |
+|------------|----------------|-------------|
+| `'public'` | Stable URL present on every read (e.g. CDN). | Logos, marketing assets, anything safe to share publicly. |
+| `'private'` | `url` absent on `FileMeta`; call the fetch route for a short-lived signed URL. | PII, contracts, anything requiring auth-gated access. |
+
+The fetch route re-checks tenant scoping before issuing a signed URL, so a borrowed `_id` from another tenant returns `404`, not a URL.
+
+## Field-Level ACL
+
+Apply `acl` to a file field just like any other field:
+
+```js
+{
+  name: 'contract',
+  type: 'File',
+  file: { storage: 's3', visibility: 'private' },
+  acl: { read: ['admin', 'legal'] },
+}
+```
+
+Without a matching role, the field is stripped from responses and the `fetch_<path>_<field>` route returns `403`.
+
+## Soft Delete Behaviour
+
+When you soft-delete a record, file blobs are **not** removed. The file routes return `404` because the record is filtered, but the blob persists in storage. Restoring the record makes the file accessible again.
+
+A hard delete — whether via `softDelete: false`, the `retentionDays` sweep, or a direct hard-delete call — **does** remove the blob from storage.
+
+<Warning>
+If you switch a schema from soft-delete to hard-delete (`softDelete: false`), existing tombstoned records will be permanently deleted along with their blobs on the next purge cycle.
+</Warning>
+
+## Tenant Isolation
+
+Storage keys are namespaced by `userId` using the pattern `<userId>/<path>/<field>/<id>.<ext>`. Even if a key were leaked, it would not be guessable for another tenant. The fetch and delete routes also re-check tenant scoping at the database layer, so a tampered key cannot bypass the model.

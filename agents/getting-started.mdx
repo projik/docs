@@ -1,0 +1,190 @@
+---
+title: "Getting Started: Boot Your First dAvePi Agent"
+sidebarTitle: "Getting Started"
+description: "Install @davepi/agent, point it at a running dAvePi backend, and have a working HTTP /chat endpoint streaming tokens in under 10 minutes."
+---
+
+This guide walks you from a fresh install to a working chat endpoint. By the end you will have an HTTP `/chat` endpoint streaming tokens, tool calls, and rendered tables back to you over Server-Sent Events. The whole thing takes under ten minutes if you already have a dAvePi server running.
+
+**Prerequisites:**
+- A running dAvePi backend (e.g. `http://localhost:5050`). If you do not have one yet, complete the [Quickstart](/quickstart) first.
+- An Anthropic API key. OpenAI and Ollama also work — see [Choosing a provider](#choosing-a-provider) below.
+- Node 18 or later.
+
+## Steps
+
+<Steps>
+
+### Get a JWT for the agent
+
+Service auth is the simplest mode. The agent will use one bearer token for every request. Register a user and grab a JWT:
+
+```bash
+curl -s -X POST http://localhost:5050/register \
+  -H 'Content-Type: application/json' \
+  -d '{"first_name":"Agent","last_name":"Demo","email":"agent@example.com","password":"sup3rsecret!"}'
+
+TOKEN=$(curl -s -X POST http://localhost:5050/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"agent@example.com","password":"sup3rsecret!"}' \
+  | jq -r .accessToken)
+
+echo "$TOKEN" | head -c 40 && echo
+```
+
+<Note>
+  The access token TTL defaults to 15 minutes. For a development loop, set `ACCESS_TOKEN_TTL=2h` in your dAvePi server's `.env` so you are not minting a new token mid-session. The `2h` ceiling is a policy limit — production deployments should use [per-user auth](/agents/auth#per-user-mode) where the agent rotates refresh tokens automatically.
+</Note>
+
+### Install and configure
+
+```bash
+npm install @davepi/agent
+```
+
+Create a `.env` file (or export these in your shell):
+
+```bash
+DAVEPI_URL=http://localhost:5050
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+DAVEPI_BEARER=<paste $TOKEN here>
+```
+
+That is the minimum. Everything else has a sensible default.
+
+### Start the agent
+
+```bash
+npx davepi-agent
+```
+
+You should see output like:
+
+```
+[INFO] agent built  provider=anthropic modelId=claude-sonnet-4-5 auth=service davepiUrl=http://localhost:5050
+[INFO] davepi-agent http channel listening  port=5060 auth=service
+```
+
+The agent fetches the full tool list from your dAvePi MCP server at boot, so every schema's CRUD operations, relations, and aggregations are immediately available — no extra configuration needed.
+
+### Talk to it over HTTP
+
+```bash
+curl -N -X POST http://localhost:5060/chat \
+  -H 'content-type: application/json' \
+  -d '{"message":"What collections do we have? Show me as a table."}'
+```
+
+The `-N` flag prevents curl from buffering the output. You will watch tokens stream in as SSE events:
+
+```
+event: tool_call
+data: {"type":"tool_call","name":"list_resources","args":{}}
+
+event: tool_result
+data: {"type":"tool_result","name":"list_resources","result":{...}}
+
+event: token
+data: {"type":"token","text":"Here are the"}
+
+event: render
+data: {"type":"render","payload":{"type":"table","columns":[...],"rows":[...]}}
+
+event: final
+data: {"type":"final","text":"...","history":[...]}
+
+event: done
+data: {"ok":true}
+```
+
+If you prefer a single JSON response instead of a stream, pass `"stream": false`:
+
+```bash
+curl -X POST http://localhost:5060/chat \
+  -H 'content-type: application/json' \
+  -d '{"message":"hello","stream":false}' | jq
+```
+
+### Try the render tools
+
+The agent has two synthetic tools — `render_table` and `render_chart` — that ask for a structured visualization without your channel having to reinvent layout:
+
+```bash
+curl -N -X POST http://localhost:5060/chat \
+  -H 'content-type: application/json' \
+  -d '{"message":"Plot the count of records in each collection as a bar chart."}'
+```
+
+Watch for a `render` event with `payload.type === "chart"` carrying a [Vega-Lite v5](https://vega.github.io/vega-lite/) spec. The Slack channel translates this into a QuickChart image automatically.
+
+</Steps>
+
+## What the agent discovers automatically
+
+At boot, the agent calls your dAvePi MCP server and fetches the complete tool list. For every schema in your project it gets:
+
+| Tool pattern | What it does |
+|---|---|
+| `list_{path}` | Filter, paginate, and sort records |
+| `get_{path}` | Fetch a single record by id |
+| `create_{path}` | Insert a new record |
+| `update_{path}` | Patch a record by id |
+| `delete_{path}` | Delete (or soft-delete, if the schema uses tombstones) |
+| `transition_{path}` | Drive a state machine |
+| `search_{path}` | Full-text search (if the schema has `searchable` fields) |
+| `aggregate_{path}_{name}` | A named aggregation |
+| `{relation}_of_{path}` | Walk a relation to a related resource |
+
+Tenant isolation, ACL, scope filters, validation, and audit are all enforced server-side. The agent calls tools; dAvePi enforces the rules.
+
+## Choosing a provider
+
+| Provider | Default model | Requires | Notes |
+|---|---|---|---|
+| `anthropic` | `claude-sonnet-4-5` | `ANTHROPIC_API_KEY` | Best tool-calling fidelity; prompt caching on by default. |
+| `openai` | `gpt-4o` | `OPENAI_API_KEY` | Good tool-calling; no prompt-caching wiring. |
+| `ollama` | none — you must set `LLM_MODEL` | A local Ollama server | No API key, no network. Tool-calling quality depends on the model. |
+
+<CodeGroup>
+
+```bash OpenAI
+LLM_PROVIDER=openai OPENAI_API_KEY=sk-... npx davepi-agent
+```
+
+```bash Ollama (local)
+ollama pull llama3.1
+LLM_PROVIDER=ollama LLM_MODEL=llama3.1 npx davepi-agent
+```
+
+</CodeGroup>
+
+## Add Slack (optional)
+
+Two more env vars and a Slack app, and the same agent process gains a Slack bot. For local development without a public URL, use socket mode:
+
+```bash
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+SLACK_SIGNING_SECRET=...
+SLACK_SOCKET_MODE=true
+```
+
+See the [Slack setup checklist](/agents/channels#slack-app-setup-checklist) for the full walkthrough.
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Personas & Skills" icon="brain" href="/agents/personas-memory-skills">
+    Add a persona row so the agent introduces itself as *Ada from Acme Support* instead of the generic default.
+  </Card>
+  <Card title="Auth Modes" icon="lock" href="/agents/auth">
+    Switch to per-user mode if each end-user must see only their own data.
+  </Card>
+  <Card title="Channels" icon="plug" href="/agents/channels">
+    Wire Slack or build a custom channel adapter.
+  </Card>
+  <Card title="Proactive Agents" icon="clock" href="/agents/proactive-agents">
+    Schedule a daily SLA digest or automated follow-up.
+  </Card>
+</CardGroup>

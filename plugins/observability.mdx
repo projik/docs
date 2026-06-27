@@ -1,0 +1,277 @@
+---
+title: "Observability Plugins — Sentry & Audit Log Export"
+sidebarTitle: "Observability"
+description: "Track errors with Sentry (secrets auto-scrubbed) and export an immutable, queryable audit log of every record mutation for compliance and debugging."
+---
+
+Two plugins handle observability in dAvePi. `davepi-plugin-sentry` forwards 5xx errors to Sentry with automatic secret redaction and performance tracing. `davepi-plugin-audit` writes an immutable, append-only audit log of every CRUD mutation to a queryable MongoDB collection with full REST and GraphQL access. Both are dormant until their credentials are set, so you can declare them in `package.json` before your environment is fully provisioned.
+
+<Tabs>
+  <Tab title="Sentry">
+
+## davepi-plugin-sentry
+
+`davepi-plugin-sentry` initialises `@sentry/node` at boot when `SENTRY_DSN` is set. It forwards 5xx errors to Sentry after the framework's `errorHandler` has already written the response — so the HTTP response shape is unchanged and there is exactly one capture path. Every event is auto-tagged with the failing user's ID, `accountId`, and `req_id`, and `beforeSend` runs the same field redaction rules as the framework's pino logger so secrets never leave the process.
+
+### Install
+
+```bash
+npm install davepi-plugin-sentry
+```
+
+```json
+{
+  "davepi": {
+    "plugins": ["davepi-plugin-sentry"]
+  }
+}
+```
+
+### Sentry project setup
+
+<Steps>
+  <Step title="Create a project">
+    In [sentry.io](https://sentry.io), create a project of platform **Node.js → Express**.
+  </Step>
+  <Step title="Copy the DSN">
+    Go to *Settings → Projects → (your project) → Client Keys (DSN)* and copy the DSN. It looks like:
+    ```
+    https://examplePublicKey@o123456.ingest.sentry.io/7891011
+    ```
+  </Step>
+  <Step title="Set env vars and boot">
+    ```bash
+    SENTRY_DSN=https://examplePublicKey@o123456.ingest.sentry.io/7891011
+    SENTRY_ENVIRONMENT=production
+    SENTRY_RELEASE=$(git rev-parse HEAD)   # or leave unset; see auto-detection below
+    ```
+    Trigger a deliberate 5xx. Within seconds it appears in your Sentry Issues dashboard with the full stack trace, `req_id` tag, and user context attached.
+  </Step>
+</Steps>
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `SENTRY_DSN` | yes (else dormant) | — | DSN from your Sentry project. |
+| `SENTRY_ENVIRONMENT` | no | `NODE_ENV` | Environment tag (`production`, `staging`, …). |
+| `SENTRY_RELEASE` | no | `package.json` version, then `git rev-parse HEAD` | Release ID used for regression detection and source-map association. |
+| `SENTRY_TRACES_SAMPLE_RATE` | no | `0` (off) | `0.0`–`1.0`. Enables Apollo (GraphQL) + Mongoose query spans. |
+| `SENTRY_PROFILES_SAMPLE_RATE` | no | `0` (off) | CPU profiling. Requires the optional `@sentry/profiling-node` peer. |
+| `SENTRY_IGNORE_ERRORS` | no | — | Comma-separated error class names or message substrings to drop before send. |
+| `SENTRY_MIN_STATUS` | no | `500` | Only forward errors with an HTTP status ≥ this value. Set `400` to also capture 4xx errors (usually noise). |
+| `SENTRY_SEND_DEFAULT_PII` | no | `false` | Sentry's `sendDefaultPii`. Off by default — request bodies and user-agents carry PII. |
+
+### What you get out of the box
+
+<CardGroup cols={2}>
+  <Card title="5xx capture, response unchanged" icon="shield-check">
+    The error forwarder sits just before `errorHandler`. It captures the exception, then calls `next(err)` so `errorHandler` writes the canonical `{ error: { code, message } }` body unchanged.
+  </Card>
+  <Card title="4xx stays out of the way" icon="filter">
+    `SENTRY_MIN_STATUS=500` keeps `ValidationError`, `NotFoundError`, `UnauthorizedError`, and Mongoose `CastError` noise out of Sentry. Lower to `400` only if you explicitly want it.
+  </Card>
+  <Card title="User and tenant context" icon="user">
+    Every event auto-tags `user.id` and `accountId` from `req.user`, plus `req_id` — the same value the pino log line carries, so a Sentry issue links directly to its log line.
+  </Card>
+  <Card title="Secret redaction parity" icon="eye-slash">
+    `beforeSend` runs the same rules as `utils/logger.js` — `authorization`, `cookie`, `set-cookie`, `*.password`, `*.token`, `*.encryptedPassword` — over request body, user, extras, and breadcrumbs. A `password` field in a request body is `[REDACTED]` in Sentry.
+  </Card>
+</CardGroup>
+
+### Performance tracing (opt-in)
+
+Set `SENTRY_TRACES_SAMPLE_RATE` to a non-zero value to enable Apollo (GraphQL) and Mongoose query spans on each request transaction:
+
+```bash
+SENTRY_TRACES_SAMPLE_RATE=0.1   # sample 10% of requests
+```
+
+Keep the rate low in production (`0.1` or lower) — tracing every Mongoose query is high-cardinality. Add CPU profiling with the optional peer:
+
+```bash
+npm install @sentry/profiling-node
+# then set:
+SENTRY_PROFILES_SAMPLE_RATE=0.1
+```
+
+### Programmatic API
+
+Call `captureException` and `setRequestContext` from lifecycle hooks — both are safe no-ops when the plugin is dormant:
+
+```js
+// schema/versions/v1/order.js
+const sentry = require('davepi-plugin-sentry');
+
+module.exports = {
+  path: 'order',
+  hooks: {
+    afterCreate: async ({ record }) => {
+      try {
+        await chargeCard(record);
+      } catch (err) {
+        // 4xx-ish business errors won't reach the global forwarder;
+        // capture them explicitly with context for triage.
+        sentry.captureException(err, {
+          tags:  { feature: 'billing' },
+          extra: { orderId: record._id },
+        });
+        throw err;
+      }
+    },
+  },
+};
+```
+
+```js
+// Add context for the lifetime of the current request.
+sentry.setRequestContext({ feature: 'onboarding' });
+
+// Raw @sentry/node SDK for advanced use.
+const Sentry = sentry.client;
+```
+
+  </Tab>
+  <Tab title="Audit Log">
+
+## davepi-plugin-audit
+
+`davepi-plugin-audit` subscribes to the in-process record event bus and writes one document per CRUD mutation into an auto-registered `audit` collection. Each row includes `before` and `after` snapshots, an RFC 6902 JSON-Patch `diff`, the actor's `userId`, and request metadata (`ip`, `userAgent`, `reqId`). The collection is exposed through the standard dAvePi REST and GraphQL surfaces so you can query it like any other resource.
+
+### Install
+
+```bash
+npm install davepi-plugin-audit
+```
+
+```json
+{
+  "davepi": {
+    "plugins": ["davepi-plugin-audit"]
+  }
+}
+```
+
+That's it — no schema changes required. Every mutation through REST or GraphQL becomes an audit row automatically.
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `AUDIT_ENABLED` | no | `true` | Master switch. Set to `false` to leave the plugin dormant. |
+| `AUDIT_RETENTION_DAYS` | no | `365` | TTL on the `at` field. `0` keeps rows forever. |
+| `AUDIT_BULK_BYPASS` | no | `false` | When `true`, bulk mutations (`updateMany`, `removeMany`) are not audited. Reduces write volume on high-throughput paths. |
+| `AUDIT_INCLUDE` | no | *(all resources)* | Comma-separated allowlist. Leave unset to audit everything. |
+| `AUDIT_EXCLUDE` | no | — | Comma-separated denylist. Wins over `AUDIT_INCLUDE` on conflict. |
+| `AUDIT_REDACT` | no | `password,token,secret` | Comma-separated field names whose values are replaced with `[REDACTED]` in `before` and `after`. |
+
+### Audit row schema
+
+| Field | Description |
+|-------|-------------|
+| `userId` | Actor's `user_id`. Also the tenant-scope key for reads. |
+| `accountId` | Actor's `accountId` when present. |
+| `action` | `created`, `updated`, `deleted`, `transitioned`, or a custom string. |
+| `resource` | Schema `path`, e.g. `order`. |
+| `resourceId` | Single-record `_id`, or `null` for bulk events. |
+| `before` | Pre-mutation snapshot (post-redaction). `null` on `created`. |
+| `after` | Post-mutation snapshot (post-redaction). `null` on hard `deleted`. |
+| `diff` | RFC 6902 JSON-Patch from `before` to `after`. |
+| `filter` | Mongo filter for bulk events. |
+| `numAffected` | Number of records changed by a bulk event. |
+| `ip`, `userAgent`, `reqId` | Request metadata. |
+| `at` | Timestamp (also drives the TTL index). Sort by this field. |
+
+### Query the audit log
+
+<CodeGroup>
+```bash REST examples
+# All events for one record, newest first
+GET /api/v1/audit?resource=order&resourceId=<oid>&__sort=at:desc
+
+# All deletes in the last 30 days
+GET /api/v1/audit?action=deleted&at__gte=2026-04-25T00:00:00Z
+
+# All audit rows for invoices
+GET /api/v1/audit?resource=invoice&__sort=at:desc
+```
+
+```graphql GraphQL
+query {
+  auditMany(
+    filter: { resource: "order" }
+    sort: AT_DESC
+    limit: 50
+  ) {
+    _id
+    action
+    resourceId
+    userId
+    before
+    after
+    diff
+    at
+  }
+}
+```
+</CodeGroup>
+
+### Tenant scope and admin access
+
+Regular callers see only audit rows where `userId` matches their own — the standard dAvePi owner-scope rule. Callers with the `admin` role bypass the owner predicate and see cross-tenant rows. Grant the `admin` role to compliance reviewers who need cross-tenant access.
+
+<Warning>
+The plugin enforces append-only at the API layer — write and delete operations on the `audit` collection are refused with `403`. Direct database access (`db.audit.deleteMany(...)`) bypasses this protection. For regulatory immutability, combine the plugin with MongoDB replica-set RBAC or periodic archival to S3 with object lock.
+</Warning>
+
+### Custom audit entries from hooks
+
+Call `audit.record()` for non-CRUD events you still want trailed — state machine transitions, contract signings, admin overrides:
+
+```js
+// schema/versions/v1/contract.js
+const audit = require('davepi-plugin-audit');
+
+module.exports = {
+  path: 'contract',
+  hooks: {
+    afterUpdate: async ({ record, previous, user, req }) => {
+      if (previous && !previous.signedAt && record.signedAt) {
+        await audit.record({
+          userId:     user.user_id,
+          action:     'contract_signed',
+          resource:   'contract',
+          resourceId: record._id,
+          before:     previous,
+          after:      record,
+          ip:         req?.ip,
+          userAgent:  req?.get?.('user-agent'),
+          reqId:      req?.id,
+        });
+      }
+    },
+  },
+};
+```
+
+`record()` returns `true` when the row was written and `false` when the plugin is dormant or the write fails. It is best-effort — a MongoDB outage logs an error and is otherwise silent, so your hooks never block on audit writes.
+
+### Compliance use cases
+
+The `audit` collection is designed for compliance scenarios:
+
+- **SOC 2 Type II** — every data mutation is logged with actor, before/after, and timestamp.
+- **GDPR right-to-access** — query all mutations by `userId` to produce a complete history.
+- **PCI-DSS** — restrict cardholder data resources with `AUDIT_INCLUDE=payment,card` and set `AUDIT_REDACT=cardNumber,cvv,pan`.
+- **Incident forensics** — join `reqId` in the audit log to the corresponding pino log line for a complete picture of what happened and what the request looked like.
+
+### Managing storage volume
+
+Audit rows carry full `before` and `after` snapshots, so the collection grows proportionally to your mutation rate and record size. For high-throughput apps:
+
+1. Set `AUDIT_RETENTION_DAYS` to the minimum your regulations require (e.g. `90`).
+2. Set `AUDIT_BULK_BYPASS=true` to skip bulk events — one `updateMany` row per call adds up fast on hot paths.
+3. Use `AUDIT_INCLUDE` to narrow to compliance-relevant resources only.
+
+  </Tab>
+</Tabs>

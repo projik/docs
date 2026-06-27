@@ -1,0 +1,208 @@
+---
+title: "Proactive Agents: Scheduled and Autonomous Actions"
+sidebarTitle: "Proactive Agents"
+description: "Pair @davepi/agent with davepi-plugin-cron to run a fresh agent on a schedule — SLA digests, follow-ups, and daily summaries, all gated by skill approval."
+---
+
+Agents do not have to wait to be spoken to. Pair `@davepi/agent` with [`davepi-plugin-cron`](https://github.com/projik/davepi/tree/main/packages/davepi-plugin-cron) to run a fresh agent on a schedule that follows a named, approved [skill](/agents/personas-memory-skills#skills--slot-3) and posts its output to Slack — follow-ups, SLA digests, end-of-day summaries.
+
+The skill must be in `status: 'approved'` before any cron job can fire it. A draft or deprecated runbook is never executed. That means the same human-approval gate that governs interactive conversations also governs scheduled runs — no extra configuration needed.
+
+## What happens on each tick
+
+1. The cron lease fires the handler for one tenant agent.
+2. The handler loads the named skill through the agent's own MCP identity, filtered to `status: 'approved'`.
+3. The handler runs a fresh `runTurn` (empty history, no end-user) with the persona loaded and the skill's `body` inlined as the task. Live data is fetched with tools, not assumed from a snapshot.
+4. The reply (plus any `render_table` / `render_chart` output) is posted to Slack.
+
+## Wiring it up
+
+```js
+const { createAgent } = require('@davepi/agent');
+const cron = require('davepi-plugin-cron');
+
+const agent = await createAgent({ agent: { key: 'support' } });
+
+cron.register('daily-sla-digest', {
+  schedule: '0 9 * * 1-5',          // 9am on weekdays
+  handler: agent.scheduledSkill({
+    skill: 'Daily SLA digest',       // name of an approved skill for this agentKey
+    slackChannel: 'C0123456789',     // Slack channel id to post into
+    // prompt: 'optional override of the default autonomous preamble',
+    // threadTs: 'optional thread to post into',
+  }),
+});
+```
+
+`agent.scheduledSkill(...)` is a convenience shortcut around `createScheduledHandler({ agent, ... })`. Both return an async function with the cron handler signature `({ log, signal, now, name }) => result` that you hand to `cron.register(name, { schedule, handler })`.
+
+### Required and optional options
+
+| Option | Required | Notes |
+|---|---|---|
+| `agent` | yes | The result of `createAgent()` — `{ config, model, mcpClient, auth }`. |
+| `skill` | yes | The `name` of an `approved` skill row for this `agentKey`. |
+| `slackChannel` | yes | Slack channel id (e.g. `C0123…`). The bot must be a member. |
+| `prompt` | no | Override the default autonomous trigger preamble (see below). |
+| `threadTs` | no | Post into a specific Slack thread instead of the channel. |
+| `channelCtx` | no | Override the default `cron` context — needed only for per-user auth (advanced). |
+
+### The autonomous trigger preamble
+
+By default the handler prepends this preamble to the skill body:
+
+> *You are running as a scheduled job. No human is in this conversation, so there will be no follow-up — gather what you need with your tools and produce the complete output the runbook below calls for in a single reply. Use the render tools for tables/charts where the runbook asks for them.*
+
+Override it with `prompt` if you need different framing. The skill body is appended after the preamble verbatim, so the operator-approved runbook remains the source of truth.
+
+## Example: SLA digest, follow-ups, summaries
+
+<Tabs>
+  <Tab title="SLA digest">
+    Register a job that runs at 9am on weekdays and posts a table of overdue tickets:
+
+    ```js
+    cron.register('daily-sla-digest', {
+      schedule: '0 9 * * 1-5',
+      handler: agent.scheduledSkill({
+        skill: 'Daily SLA digest',
+        slackChannel: 'C0SLA123',
+      }),
+    });
+    ```
+
+    The `Daily SLA digest` skill body:
+
+    ```markdown
+    ## Daily SLA digest
+
+    1. Call `list_supportTicket` with filter `{ responseDueAt: { __lt: 'now' }, status: 'open' }`.
+    2. For each breach, note: owner, ticket id, hours overdue.
+    3. If nothing is overdue, return an empty response.
+    4. Otherwise call `render_table` with columns: Owner, Ticket, Hours Overdue.
+    ```
+
+    A run with no breaches skips the Slack post entirely — no empty ping.
+  </Tab>
+  <Tab title="Automatic follow-ups">
+    Run follow-ups every weekday afternoon for tickets that have been waiting on a customer response for more than 48 hours:
+
+    ```js
+    cron.register('customer-follow-ups', {
+      schedule: '0 14 * * 1-5',
+      handler: agent.scheduledSkill({
+        skill: 'Customer follow-up',
+        slackChannel: 'C0FOLLOWUP',
+      }),
+    });
+    ```
+  </Tab>
+  <Tab title="Daily summary">
+    Post a digest of the day's resolved tickets and open blockers to a general ops channel:
+
+    ```js
+    cron.register('end-of-day-summary', {
+      schedule: '0 17 * * 1-5',
+      handler: agent.scheduledSkill({
+        skill: 'End-of-day summary',
+        slackChannel: 'C0OPS456',
+      }),
+    });
+    ```
+  </Tab>
+</Tabs>
+
+## Human-approval gate
+
+Governance carries over for free. Because only `approved` skills are loadable during a scheduled run, a half-baked self-authored runbook can never be fired by a cron job until a human signs off. The state machine plus field-level ACL on `skill.status` is the gate — the cron handler just respects it.
+
+To disable a runbook without deleting the skill row, transition `approved → deprecated`. The next tick cannot find it and throws `SKILL_NOT_FOUND`. The cron framework surfaces the error in its lease logs.
+
+<Tip>
+  `deprecated` is terminal. Rather than re-approving a retired runbook (which would silently re-enter the L0 skill index), author a fresh skill and approve that instead.
+</Tip>
+
+## How proactive runs differ from user-triggered turns
+
+| Aspect | User-triggered turn | Proactive (scheduled) run |
+|---|---|---|
+| History | Loaded from the persisted `conversation` row | Empty — no prior conversation |
+| End-user context | `channelCtx.channelUserId` set; customer profile slot populated | No `channelUserId`; customer profile slot is empty |
+| Output destination | Streamed back to the channel that sent the message | Posted to a configured Slack channel |
+| Preamble | Normal persona + operating contract | Autonomous trigger preamble prepended to the skill body |
+| Empty-output handling | Always sends a reply | Skips the post; logs *"scheduled skill produced no output"* |
+
+## Cancellation (lost leases)
+
+`davepi-plugin-cron` distributes jobs across nodes via a lease. If the lease is lost mid-run, the cron framework's `AbortSignal` is threaded all the way through the handler:
+
+```
+cron lease signal
+   │
+   ▼
+createScheduledHandler ──▶ runScheduledSkill ──▶ runTurn
+                                                   │
+                                                   ├──▶ MCP tool calls (signal forwarded)
+                                                   └──▶ model.streamText (abortSignal)
+```
+
+The handler checks `signal.aborted` before loading the skill, before running the turn, and before posting to Slack. If the lease is lost during the turn, the handler returns `{ posted: false, aborted: true }` and nothing is posted — so the node that takes over the lease can do the post without a double-message.
+
+## Multi-tenant cron
+
+Tenant scoping is inherited, not re-implemented. The agent's service auth owns exactly one tenant's data, so the skill lookup and the run are tenant-scoped server-side. For a multi-tenant deployment, register one job per tenant:
+
+```js
+for (const tenant of tenants) {
+  const tenantAgent = await createAgent({
+    auth: { bearer: tenant.agentJwt },   // tenant-specific JWT
+    agent: { key: 'support' },
+  });
+  cron.register(`sla-${tenant.id}`, {
+    schedule: '0 9 * * 1-5',
+    handler: tenantAgent.scheduledSkill({
+      skill: 'Daily SLA digest',
+      slackChannel: tenant.slackChannel,
+    }),
+  });
+}
+```
+
+## Direct API (without Slack)
+
+If you want to post output to a different surface, write to a database row, or just log — use `runScheduledSkill` directly instead of going through `agent.scheduledSkill`:
+
+```js
+const { runScheduledSkill } = require('@davepi/agent');
+
+const { text, history, skill, renderBlocks } = await runScheduledSkill({
+  config: agent.config,
+  model: agent.model,
+  mcpClient: agent.mcpClient,
+  skill: 'Daily SLA digest',
+  // optional:
+  prompt: 'Custom preamble…',
+  channelCtx: { channel: 'cron', agentKey: 'support' },
+  signal: someAbortSignal,
+  onEvent: (evt) => log.debug(evt),
+});
+
+// Do whatever you want with text + renderBlocks.
+```
+
+`runScheduledSkill` throws an error with `code: 'SKILL_NOT_FOUND'` if no approved skill matches the name. It returns `{ aborted: true, skill?, renderBlocks? }` on signal abort.
+
+## Per-user auth and cron
+
+Service auth is the default and the expectation for proactive agents. A scheduled run has no end-user, so the default `cron` context has no `channelUserId`. Per-user auth resolves the agent's identity *from* the end-user — so registering a per-user agent in a cron job is rejected at registration unless you pass an explicit `channelCtx`:
+
+```js
+// Advanced: a job that acts as one specific linked user.
+agent.scheduledSkill({
+  skill: 'Weekly portfolio summary',
+  slackChannel: 'C0123…',
+  channelCtx: { channel: 'cron', channelUserId: 'user-42' },
+});
+```
+
+The handler fails fast at registration (not on the first tick), matching `davepi-plugin-cron`'s posture of surfacing misconfiguration up front.

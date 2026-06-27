@@ -1,0 +1,103 @@
+---
+title: "Hot Reload: Update Schemas Without Restarting"
+sidebarTitle: "Hot Reload"
+description: "Save a schema file in development and watch REST routes, GraphQL resolvers, Swagger docs, and MCP tools update live — no server restart required."
+---
+
+In development, dAvePi watches your `schema/versions/v1/` directory and reloads any changed schema file live. REST routes, GraphQL resolvers, Swagger fragments, and MCP tools all update within 50–150ms of a file save. Requests already in flight finish against the old surface; new requests hit the updated one immediately.
+
+## Enable hot reload
+
+Set the environment variable before starting the server:
+
+```bash
+HOT_RELOAD_SCHEMAS=true npm start
+```
+
+<Warning>
+  Hot reload is gated on `NODE_ENV !== 'production' && HOT_RELOAD_SCHEMAS=true`. It never activates in production. Use [migrations](/operations/migrations) for schema changes on running production instances.
+</Warning>
+
+## What gets reloaded
+
+Every file event triggers a precise, targeted rebuild — not a full server restart:
+
+| Event | What rebuilds |
+|-------|---------------|
+| Add a new schema file | New Mongoose model, new REST router, new GraphQL type composer and resolvers, new Swagger fragment, new MCP tools. Connected MCP clients receive `tools/list_changed`. |
+| Edit an existing schema | Mongoose model is `deleteModel`'d and re-registered, REST router replaced, GraphQL TC rebuilt, Swagger updated, MCP tools refreshed. |
+| Delete a schema file | Router spliced from the Express stack, model deleted, GraphQL TC removed, Swagger fragment unset, MCP tools unregistered. |
+
+## How it works
+
+### Single-flight queue
+
+`utils/schemaLoader.js` exposes a single-flight queue (`opChain`). The chokidar watcher in `utils/schemaWatcher.js` produces `add` / `change` / `unlink` events; each event enqueues a `loadSchema` or `unloadSchema` operation. Operations run sequentially, so a fast burst of file saves cannot interleave registry mutations with `rebuildGraphQL`.
+
+### GraphQL: indirection middleware
+
+Apollo Server v3 builds its schema at construction time — there is no "swap the schema" API. dAvePi solves this with a stable indirection layer mounted once at boot:
+
+```js
+// app.js mounts ONCE at boot:
+let apolloRouter = null;
+app.use((req, res, next) => {
+  if (apolloRouter) return apolloRouter(req, res, next);
+  return next();
+});
+
+// On every schema reload, the loader does:
+//   1. Build a new ApolloServer + apply its middleware to a fresh
+//      express.Router.
+//   2. Atomically swap the `apolloRouter` reference.
+//   3. Stop the old ApolloServer (release plugins / sockets).
+```
+
+Order matters: **build → swap → stop**. Stopping first would leave the indirection pointing at a dead router during the rebuild window, causing in-flight requests to fail.
+
+### REST: per-schema routers
+
+Each schema's REST routes live on their own `express.Router`. When a schema is unloaded, `unloadSchema` splices that router out of `app._router.stack` by reference. Express has no public "remove route" API, so this is the cleanest way to clear a schema's surface without rebuilding the whole stack.
+
+After every load or unload, the framework re-appends the central `errorHandler` so it stays at the tail of the stack — Express only routes errors to a final tail handler.
+
+### MCP: live tool registry
+
+The stdio MCP server subscribes to `schemaLoader.onChange` and rebuilds its tool list on every schema change. Each rebuild calls `server.sendToolListChanged()` so connected clients — Claude Desktop, Cursor, Claude Code — refresh their tool registry without reconnecting.
+
+The HTTP MCP transport at `/mcp` builds a fresh server per request, so hot-reload is automatic with no special wiring.
+
+## Performance
+
+Hot reload runs entirely in-process — no fork, no restart. A typical single-schema reload completes in **50–150ms** on modest hardware (MongoDB index creation is the slow step). The single-flight queue coalesces a burst of saves: `rebuildGraphQL` only fires once the whole batch has settled.
+
+## Test coverage
+
+`test/hot-reload.test.js` covers the full lifecycle:
+
+- Programmatic load / unload (no file events) asserts that routes, Swagger fragments, and GraphQL fields appear and disappear correctly.
+- Reloading the same schema is idempotent — no duplicate routes are mounted.
+- Edits to an existing schema with new fields round-trip on `POST` / `GET`.
+- The watcher is correctly gated by both `HOT_RELOAD_SCHEMAS` and `NODE_ENV`.
+
+## Development workflow
+
+<Steps>
+  <Step title="Start with hot reload enabled">
+    ```bash
+    HOT_RELOAD_SCHEMAS=true npm start
+    ```
+  </Step>
+  <Step title="Edit a schema file">
+    Add, change, or remove a field in any file under `schema/versions/v1/`. Save the file.
+  </Step>
+  <Step title="See the change live">
+    Within 50–150ms the terminal logs the reload. Hit `/_describe`, Swagger, or your REST endpoint — the change is already live.
+  </Step>
+  <Step title="Verify in the manifest">
+    ```bash
+    curl -s http://localhost:5050/_describe \
+      | jq '.schemas[] | select(.path=="deal").fields'
+    ```
+  </Step>
+</Steps>

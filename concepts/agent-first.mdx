@@ -1,0 +1,119 @@
+---
+title: "Agent-First Design: Built for AI Coding Agents"
+sidebarTitle: "Agent-First"
+description: "dAvePi was designed assuming Claude Code, Cursor, or another AI agent builds on it. Discover how every design decision optimises for that workflow."
+---
+
+Most backends assume a human writes the schemas and the integration glue. dAvePi assumes an AI coding agent does both. That assumption produces different choices than a human-first framework would make — in the discovery surface, the tool protocol, the error format, and the scaffolded project structure.
+
+## Discovery before code
+
+`GET /_describe` returns a compact JSON manifest of every loaded schema — fields, relations, aggregations, file fields, ACL slots, soft-delete / audit / search flags, REST endpoints, GraphQL queries and mutations, and MCP tools.
+
+An agent landing on a fresh dAvePi can plan against the full API surface in a single round-trip, before writing a line of integration code. Compare that with `swagger.json`: 5–10× larger, Swagger 2.0 conventions, and no first-class representation of relations or state machines.
+
+See the [\_describe reference](/surfaces/describe) for the full manifest shape.
+
+## Native tool calls
+
+Agents call tools; they don't compose HTTP requests. dAvePi's MCP server exposes per-resource tools — `list_account`, `create_deal`, `update_quote`, and so on — that agents call as first-class operations:
+
+```json
+{
+  "name": "create_deal",
+  "arguments": {
+    "record": { "title": "Q1", "amount": 50000 },
+    "idempotencyKey": "9f3c-..."
+  }
+}
+```
+
+The same handlers that back REST and GraphQL back the tool calls — no divergence, no maintenance tax. Both HTTP and stdio transports ship out of the box.
+
+See the [MCP server reference](/surfaces/mcp) for the full tool catalogue.
+
+## Idempotent retries
+
+Agents retry. Network blips, model timeouts, harness restarts — without idempotency, retries silently create duplicate records, one of the most common agent failure modes in production.
+
+dAvePi accepts an `Idempotency-Key` header on every `POST`, plus an `idempotencyKey` argument on every `create_<path>` MCP tool:
+
+- Same key + same body = original response replayed.
+- Different body under the same key = `409 IDEMPOTENCY_CONFLICT`.
+
+An atomic claim-execute-complete protocol guards against duplicate creates under concurrent retries.
+
+See [Idempotency keys](/features/idempotency) for the full protocol.
+
+## Structured errors agents can act on
+
+Every typed error the framework returns carries a structured payload:
+
+```json
+{
+  "error": {
+    "code": "INVALID_TRANSITION",
+    "message": "Cannot transition stage from 'qualifying' to 'won'",
+    "details": {
+      "current": "qualifying",
+      "attempted": "won",
+      "allowed": ["proposal", "lost"]
+    }
+  }
+}
+```
+
+Agents read `code`, not the human-readable `message`, and decide whether to retry, self-correct, or surface the error. `INVALID_TRANSITION` ships the allowed transitions; `IDEMPOTENCY_CONFLICT` ships the conflicting body's hash; `VALIDATION` ships a `recoverable` flag.
+
+See the [Error reference](/reference/errors) for the full catalogue.
+
+## Type safety end to end
+
+`davepi gen-client` walks the schema map and emits a fully-typed TypeScript client. The same schema file that drives the server drives the agent's frontend code at compile time — a typo in a field name is a red squiggle, not a runtime 500.
+
+```ts
+const won = await api.deal.list({ filter: { stage: 'won' } });
+//                                          ^^^^^^^^
+// 'won' is typed as a literal; 'wno' is a compile error.
+```
+
+See [TypeScript client](/surfaces/client) for usage.
+
+## A drop-in agent guide, mirrored across runtimes
+
+Every scaffolded project ships a canonical `agent.md` plus three mirrors that match each runtime's conventional file path:
+
+| File | Picked up by |
+|------|-------------|
+| `agent.md` | Canonical, human-readable source of truth. |
+| `.cursorrules` | Cursor. |
+| `AGENTS.md` | OpenAI / Codex / agentic IDEs that read this name. |
+| `.claude/skills/davepi/SKILL.md` | Claude Code skills (includes YAML frontmatter with `name` and `description`). |
+
+The guide tells the agent the conventions of the framework: don't manually wire `userId`, don't use `accountId` as a custom foreign key, prefer computed fields over client-side derivation, use `__include` rather than N+1 calls, read `_describe` before planning a non-trivial change. It also ships a schema field reference, a worked CRM example, prompt templates for common tasks, and the full typed error catalogue.
+
+<Tip>
+  Agents that read `agent.md` before writing code produce working output on the first attempt. Point your agent at it before any non-trivial task.
+</Tip>
+
+## One-line MCP wiring
+
+Connect any MCP-aware editor to a hosted or local dAvePi instance:
+
+```bash
+npx -y @davepi/mcp
+```
+
+The scaffolded `.mcp.json` pre-configures this for every new project, so there is nothing to set up manually when you open the project in Claude Code or Cursor.
+
+## Nightly eval badge
+
+[![Agent eval](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fprojik%2Fdavepi%2Fmain%2Feval%2Fresults%2Fbadge.json)](https://docs.davepi.dev/concepts/agent-eval/)
+
+The framework runs a nightly agent eval suite that exercises the full schema-to-surface pipeline through Claude. The badge reflects whether the latest nightly passed. See the agent eval methodology for details.
+
+## What this is not
+
+dAvePi is not "AI-generated code that you then maintain." The framework is hand-written. The output of any agent interaction is a schema file, and the auto-generated surface flows from it. There is no LLM call at runtime and no AI-generated SQL. The agent is a tool that builds on dAvePi; dAvePi does not use the agent.
+
+Humans write the same schemas. The agent surfaces — MCP, `_describe`, the typed client — are equally useful when you write code by hand. But where the human-friendly design choice and the agent-friendly one diverged, dAvePi chose the agent-friendly one.

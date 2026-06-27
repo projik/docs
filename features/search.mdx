@@ -1,0 +1,119 @@
+---
+title: "Add Full-Text Search to Any dAvePi Schema Resource"
+sidebarTitle: "Search"
+description: "Mark fields searchable, get a MongoDB text index automatically, a ?q= query parameter on list endpoints, and a generated MCP search tool."
+---
+
+Full-text search in dAvePi is schema-driven: you mark one or more fields `searchable: true`, and the framework builds and manages a MongoDB text index for you. Every list endpoint gains a `?q=` parameter, a `search_<path>` MCP tool is generated automatically, and the typed client gets a `search()` method — all without writing any index management code.
+
+## Declare Searchable Fields
+
+Add `searchable: true` to any `String` or `[String]` field in your schema definition.
+
+```js
+fields: [
+  { name: 'name',        type: String,    searchable: true, required: true },
+  { name: 'description', type: String,    searchable: true },
+  { name: 'tags',        type: [String],  searchable: true },
+]
+```
+
+You can mark multiple fields searchable. dAvePi builds a single compound MongoDB text index across all of them. The framework owns this index — it creates and drops it on every schema reload, so removing `searchable: true` from a field automatically removes it from the index on the next restart.
+
+<Note>
+MongoDB allows only **one text index per collection**. Because dAvePi manages that index for you, you cannot add a separate hand-built text index alongside it.
+</Note>
+
+## Search via REST
+
+Pass the `q` query parameter on any list endpoint to run a full-text search:
+
+<CodeGroup>
+
+```http Basic search
+GET /api/v1/contact?q=jane%20doe
+```
+
+```http Sort by relevance score
+GET /api/v1/contact?q=jane&__sort=score
+```
+
+```http Combine with filters
+GET /api/v1/contact?q=jane&accountId=abc&__page=1
+```
+
+</CodeGroup>
+
+Results default to relevance-ranked order when `q` is present. Use `__sort=score` to make the ordering explicit. Filters `AND` with the text predicate, so you can scope a search to a specific tenant or any additional constraints.
+
+## Search via GraphQL
+
+The `<path>Search` query field accepts the same `q` argument:
+
+```graphql
+{
+  contactSearch(q: "jane") {
+    results {
+      _id
+      name
+      description
+    }
+  }
+}
+```
+
+## Search via MCP
+
+The `search_<path>` tool is generated automatically for any schema that has at least one searchable field. It is equivalent to calling the list endpoint with `sort=score:desc`.
+
+```json
+{
+  "name": "search_contact",
+  "arguments": { "q": "jane" }
+}
+```
+
+## Search via Typed Client
+
+```ts
+const matches = await api.contact.search('jane');
+// ListResponse<Contact>
+```
+
+## Tenant Scoping
+
+Search queries are scoped to the authenticated user exactly like any other read. The framework injects `userId: req.user.user_id` before the text predicate. To search across tenants, the caller needs the `acl.list` bypass role on the schema.
+
+## External Search Plugins
+
+MongoDB's built-in text search is token-based (whole words and phrases) and uses the English stemmer by default. If you need typo tolerance, custom language analyzers, or faceted search, connect an external search service via a plugin.
+
+<CardGroup cols={3}>
+  <Card title="Typesense" icon="magnifying-glass">
+    Low-latency typo-tolerant search. Self-host or use Typesense Cloud.
+  </Card>
+  <Card title="Meilisearch" icon="magnifying-glass">
+    Open-source, developer-friendly, with instant-search and faceting.
+  </Card>
+  <Card title="Algolia" icon="magnifying-glass">
+    Managed search-as-a-service with analytics and AI ranking.
+  </Card>
+</CardGroup>
+
+<Tip>
+Use the built-in MongoDB text index for simple keyword search on small-to-medium datasets. Reach for an external plugin when you need fuzzy matching, multi-language stemming, or sub-10ms latency at scale.
+</Tip>
+
+## Limits
+
+<Accordion title="One text index per collection">
+  MongoDB enforces a single text index per collection. dAvePi allocates that index for your schema, so you cannot add a manual text index alongside it. If you need finer-grained control, use an external search plugin.
+</Accordion>
+
+<Accordion title="No fuzzy matching">
+  The built-in search matches whole words and phrases only. Typo tolerance requires an external plugin (Typesense, Meilisearch, or Algolia).
+</Accordion>
+
+<Accordion title="No custom language stemming">
+  dAvePi uses MongoDB's default English text analyzer. For non-English languages or custom stemming, use a custom route or an external search plugin.
+</Accordion>

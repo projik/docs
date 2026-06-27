@@ -1,0 +1,243 @@
+---
+title: "Deploying a dAvePi App to Production"
+sidebarTitle: "Deployment"
+description: "Environment variables, production posture, and step-by-step deploy guides for Fly.io, Render, Railway, and Docker."
+---
+
+dAvePi is a standard Node.js Express server. Anything that can run a Node app — Render, Fly.io, Railway, a Docker container on a VPS — can host it. There is no build step: `node index.js` boots the server. Before you deploy, you need two things: a MongoDB connection string and a `TOKEN_KEY` secret.
+
+## Prerequisites
+
+<CardGroup cols={2}>
+  <Card title="MongoDB connection string" icon="database">
+    Any MongoDB ≥ 5.0 works: MongoDB Atlas (recommended), a self-hosted replica set, or a Cosmos DB cluster with the Mongo API. Get the SRV connection string from your provider's connect dialog.
+  </Card>
+  <Card title="TOKEN_KEY secret" icon="key">
+    A random string of at least 32 bytes used to sign JWT access tokens. Generate one with: `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`
+  </Card>
+</CardGroup>
+
+## Environment variables
+
+Set these on your platform before the first deploy. Every variable maps to a key in `.env.example`.
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `MONGO_URI` | **yes** | Full MongoDB connection string, e.g. `mongodb+srv://user:pass@cluster.mongodb.net/davepi`. |
+| `TOKEN_KEY` | **yes** | JWT signing secret. Rotate via a coordinated downtime window — all in-flight tokens are invalidated on change. |
+| `NODE_ENV` | **yes** | Set to `production`. Disables hot reload, GraphQL playground, introspection, and verbose error messages. |
+| `API_PORT` | no | HTTP port the server listens on. Defaults to `4001`. |
+| `PAGE_SIZE` | no | Default page size for list endpoints. Defaults to `20`. |
+| `CORS_ORIGINS` | no | Comma-separated origin allowlist, e.g. `https://app.example.com,https://admin.example.com`. Do not use `*` in production. |
+| `LOG_LEVEL` | no | `trace` \| `debug` \| `info` \| `warn` \| `error` \| `fatal` \| `silent`. Defaults to `info`. |
+| `STORAGE_DRIVER` | no | `local` (default) or `s3`. Pick `s3` for production file uploads. |
+| `STORAGE_S3_BUCKET` | if `s3` | S3 bucket name. The bucket must already exist. |
+| `STORAGE_S3_REGION` | if `s3` | AWS region, e.g. `us-east-1`. |
+| `HOT_RELOAD_SCHEMAS` | no | Keep `false` (or unset) in production. The flag is gated on `NODE_ENV !== 'production'` anyway. |
+
+A complete production environment file:
+
+```bash
+NODE_ENV=production
+API_PORT=5050
+
+MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/davepi
+TOKEN_KEY=<48-byte-hex-secret>
+
+PAGE_SIZE=20
+CORS_ORIGINS=https://app.example.com
+
+STORAGE_DRIVER=s3
+STORAGE_S3_BUCKET=acme-davepi-uploads
+STORAGE_S3_REGION=us-east-1
+
+HOT_RELOAD_SCHEMAS=false
+```
+
+## Platform deploy guides
+
+<Tabs>
+  <Tab title="Fly.io">
+    Fly.io is the recommended starting point for small production apps — idle replicas cost nothing, and `fly launch` does most of the setup.
+
+    <Steps>
+      <Step title="Install the Fly CLI and log in">
+        ```bash
+        # macOS
+        brew install flyctl
+        fly auth login
+        ```
+      </Step>
+      <Step title="Launch the app">
+        Run this from your project root. Fly detects the `Dockerfile` and creates a `fly.toml`.
+
+        ```bash
+        fly launch
+        ```
+
+        When prompted, choose a region close to your MongoDB cluster to minimise latency.
+      </Step>
+      <Step title="Set secrets">
+        ```bash
+        fly secrets set \
+          MONGO_URI="mongodb+srv://user:pass@cluster.mongodb.net/davepi" \
+          TOKEN_KEY="<your-secret>"
+        ```
+      </Step>
+      <Step title="Deploy">
+        ```bash
+        fly deploy
+        ```
+
+        Fly builds the image, pushes it, and replaces the running instance. The health check polls `GET /healthz` until it returns 200.
+      </Step>
+    </Steps>
+
+    <Tip>
+      Point your MongoDB Atlas cluster's network access list at Fly's outbound IP ranges, or use a VPC peer. See the [Fly.io docs on static IPs](https://fly.io/docs/reference/static-egress-ip/) if you need a fixed egress address.
+    </Tip>
+  </Tab>
+  <Tab title="Render">
+    Render runs your app as a Web Service and manages TLS, rolling deploys, and health checks automatically.
+
+    <Steps>
+      <Step title="Create a Web Service">
+        In the Render dashboard, click **New → Web Service** and connect your GitHub repository.
+      </Step>
+      <Step title="Configure the service">
+        | Setting | Value |
+        |---------|-------|
+        | **Environment** | Node |
+        | **Build Command** | `npm install --production` |
+        | **Start Command** | `node index.js` |
+        | **Health Check Path** | `/healthz` |
+      </Step>
+      <Step title="Add environment variables">
+        Under **Environment**, add `MONGO_URI`, `TOKEN_KEY`, `NODE_ENV=production`, and any other variables from the table above.
+      </Step>
+      <Step title="Deploy">
+        Click **Create Web Service**. Render triggers a deploy automatically on every push to your configured branch.
+      </Step>
+    </Steps>
+
+    <Note>
+      Render does not provide a managed MongoDB. Use [MongoDB Atlas](https://www.mongodb.com/atlas) as an external cluster and set `MONGO_URI` to the Atlas SRV string.
+    </Note>
+  </Tab>
+  <Tab title="Railway">
+    Railway can provision a MongoDB add-on alongside your app in the same project, which simplifies the connection string setup.
+
+    <Steps>
+      <Step title="Create a new project">
+        In the Railway dashboard, click **New Project → Deploy from GitHub repo** and select your repository.
+      </Step>
+      <Step title="Add a MongoDB service (optional)">
+        Click **New → Database → MongoDB**. Railway injects `MONGO_URL` automatically into your app service. Rename it to `MONGO_URI` in the app's variable settings, or alias it in your start command.
+      </Step>
+      <Step title="Set environment variables">
+        Under your app service's **Variables** tab, add:
+
+        ```
+        TOKEN_KEY=<your-secret>
+        NODE_ENV=production
+        MONGO_URI=${{MongoDB.MONGO_URL}}   # Railway reference syntax if using the add-on
+        ```
+      </Step>
+      <Step title="Configure the start command">
+        In your service's **Settings**, set the start command to:
+
+        ```bash
+        node index.js
+        ```
+      </Step>
+      <Step title="Deploy">
+        Railway deploys automatically on push. Watch the build logs in the dashboard to confirm the server logs `listening on port <N>`.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="Docker">
+    Use the production Docker image for self-hosted VPS deploys, ECS, GKE, or any container runtime.
+
+    **Build the production image:**
+
+    ```bash
+    docker build -t davepi:latest .
+    ```
+
+    The `Dockerfile` is multi-stage. The default target produces a slim, non-root, production image with no devDependencies and no `nodemon`.
+
+    **Run the container:**
+
+    ```bash
+    docker run --rm -p 4001:4001 \
+      -e MONGO_URI="mongodb+srv://user:pass@cluster.mongodb.net/davepi" \
+      -e TOKEN_KEY="<your-secret>" \
+      -e NODE_ENV=production \
+      davepi:latest
+    ```
+
+    **With an env file:**
+
+    ```bash
+    docker run --rm -p 4001:4001 --env-file .env.production davepi:latest
+    ```
+
+    **Docker Compose (production variant):**
+
+    ```yaml
+    services:
+      api:
+        image: davepi:latest
+        ports:
+          - "4001:4001"
+        environment:
+          NODE_ENV: production
+          MONGO_URI: ${MONGO_URI}
+          TOKEN_KEY: ${TOKEN_KEY}
+        restart: unless-stopped
+        healthcheck:
+          test: ["CMD", "wget", "-qO-", "http://localhost:4001/healthz"]
+          interval: 30s
+          timeout: 5s
+          retries: 3
+    ```
+
+    <Warning>
+      Do not use the `dev` Docker Compose target in production. It mounts source code as a bind volume and runs `nodemon`. Build the production image explicitly with `docker build -t davepi:latest .`.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## Health check
+
+`GET /healthz` returns `{ "status": "ok" }` plus the MongoDB connection state. Wire it to your platform's liveness probe. Pair with `GET /_describe` (which also returns 200 when schemas are loaded) for a readiness probe.
+
+## Production-disabled features
+
+Setting `NODE_ENV=production` automatically disables:
+
+| Feature | Effect |
+|---------|--------|
+| Hot reload | `HOT_RELOAD_SCHEMAS` is ignored, even if set to `true`. |
+| GraphQL playground | The sandbox UI at `/graphql/` is not served. |
+| GraphQL introspection | Introspection queries return an error. Override in `app.js` if you need introspection for an admin tool. |
+| Verbose error messages | Unknown errors are reduced to `"Internal server error"`. The real error is in the server log under `reqId`. |
+
+## TLS
+
+Terminate TLS at your load balancer, CDN, or reverse proxy (Cloudflare, AWS ALB, nginx). The Node server speaks plain HTTP. Offloading TLS keeps certificate lifecycle management out of the application process.
+
+## Roll-out posture
+
+For schema-only changes (new field, new aggregation, new index):
+
+<Steps>
+  <Step title="Push the updated schema file">
+    Commit and push the changed schema file to your deployment branch.
+  </Step>
+  <Step title="Restart or rolling-restart the server">
+    The new schema loads at boot. Mongoose builds new indexes in the background; Apollo recomposes the GraphQL schema; MCP tools refresh.
+  </Step>
+</Steps>
+
+For changes that need a data backfill, follow the expand-migrate-contract pattern — see [Migrations](/operations/migrations).

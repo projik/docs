@@ -1,0 +1,251 @@
+---
+title: "Logs, Metrics, and Error Tracking for dAvePi"
+sidebarTitle: "Observability"
+description: "Structured JSON logs via pino, a built-in Prometheus metrics endpoint, Sentry error tracking, and OpenTelemetry tracing — copy-paste setup for each."
+---
+
+dAvePi runs on standard Node.js, Express, Mongoose, and Apollo. Every mainstream observability tool that auto-instruments those libraries works against dAvePi out of the box — typically with zero framework changes. The framework contributes structured JSON logs, a request-scoped `reqId` on every request, a built-in `/_metrics` endpoint for Prometheus, and a centralised error handler that ensures every unhandled rejection reaches the same termination point.
+
+## Structured logs (pino)
+
+dAvePi logs to `stdout` as newline-delimited JSON using [pino](https://getpino.io). Every log line is safe to ship raw to any log collector — sensitive fields (`authorization`, `cookie`, `set-cookie`, `*.password`, `*.token`) are redacted before the line is written.
+
+Set the verbosity with `LOG_LEVEL`:
+
+```bash
+LOG_LEVEL=debug   # trace | debug | info | warn | error | fatal | silent
+```
+
+### Key log events
+
+| Event | Level | What it means |
+|-------|-------|---------------|
+| Server start | `info` | `{ "msg": "listening", "port": 5050 }` — the server is ready to accept traffic. |
+| Schema loaded | `info` | Each schema file loaded at boot, with its `path` and field count. |
+| Query executed | `debug` | MongoDB query with collection, operation, and duration. |
+| Request completed | `info` | HTTP method, path, status code, and latency in milliseconds. |
+| Error | `error` | Unhandled rejection or caught error, always with the request's `reqId`. |
+
+### HTTP request logs
+
+Every request produces a structured log line containing the method, matched route, status code, response time, and the `reqId`:
+
+```json
+{
+  "level": 30,
+  "msg": "request completed",
+  "reqId": "b3f1c2d4-...",
+  "method": "POST",
+  "url": "/api/v1/account",
+  "statusCode": 201,
+  "responseTime": 42
+}
+```
+
+The `reqId` is also set on the `x-request-id` response header. Use it to correlate a response your user saw with the server log line — especially useful for tracing `500 INTERNAL` errors.
+
+### Correlating errors with logs
+
+When a `500 INTERNAL` error reaches a client in production, the full error details are in the server log, not on the wire. Capture the `x-request-id` response header and search your log collector for that `reqId`:
+
+```bash
+# Example: search with jq on a local log file
+cat app.log | jq 'select(.reqId == "b3f1c2d4-...")'
+```
+
+## Health check endpoint
+
+`GET /healthz` returns the server and database status. Wire it to your platform's liveness probe:
+
+```json
+{ "status": "ok", "mongo": "connected" }
+```
+
+Pair with `GET /_describe` for a readiness probe — it returns `200` once all schemas are loaded and the GraphQL schema is composed.
+
+## Prometheus metrics
+
+Enable the built-in `/_metrics` endpoint with `METRICS_ENABLED=true`. Without this flag, the endpoint returns 404 and the per-request middleware is a no-op.
+
+```bash
+METRICS_ENABLED=true npm start
+```
+
+Verify it is working:
+
+```bash
+curl -s http://localhost:5050/_metrics
+```
+
+### Exposed metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| Node.js defaults | various | — | Memory, GC, event-loop lag, active handles. From `prom-client`'s `collectDefaultMetrics()`. |
+| `http_requests_total` | counter | `method`, `route`, `status_code` | Total HTTP requests completed. |
+| `http_request_duration_seconds` | histogram | `method`, `route`, `status_code` | Request latency. Buckets tuned for sub-1s web requests, extending to 5s. |
+
+The `route` label is the matched Express path template (e.g. `/api/v1/account/:id`), not the raw URL. This keeps Prometheus label cardinality bounded even at high record-ID traffic.
+
+### Prometheus scrape config
+
+```yaml
+scrape_configs:
+  - job_name: davepi
+    metrics_path: /_metrics
+    static_configs:
+      - targets: ['davepi:5050']
+    scrape_interval: 15s
+```
+
+### Securing the metrics endpoint
+
+The default `/_metrics` requires no auth (the standard Prometheus posture: scrape from an internal sidecar). If your endpoint is reachable from the public internet, set `METRICS_TOKEN`:
+
+```bash
+METRICS_ENABLED=true
+METRICS_TOKEN=$(openssl rand -hex 32)
+```
+
+Then configure your scraper to send the token as a Bearer:
+
+```yaml
+scrape_configs:
+  - job_name: davepi
+    metrics_path: /_metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/davepi-metrics-token
+    static_configs:
+      - targets: ['davepi:5050']
+```
+
+## Sentry error tracking
+
+Sentry captures unhandled exceptions and pino-logged errors with full request context.
+
+<Steps>
+  <Step title="Install the Sentry SDK">
+    ```bash
+    npm install @sentry/node
+    ```
+  </Step>
+  <Step title="Create sentry.js at the project root">
+    ```js
+    // sentry.js
+    const Sentry = require('@sentry/node');
+
+    Sentry.init({
+      dsn: process.env.SENTRY_DSN,
+      environment: process.env.NODE_ENV,
+      release: process.env.npm_package_version,
+      tracesSampleRate: parseFloat(process.env.SENTRY_TRACES_SAMPLE_RATE || '0.1'),
+      integrations: [
+        Sentry.httpIntegration(),
+        Sentry.expressIntegration(),
+        Sentry.mongooseIntegration(),
+      ],
+    });
+
+    process.on('unhandledRejection', (err) => Sentry.captureException(err));
+    ```
+  </Step>
+  <Step title="Boot with --require">
+    ```bash
+    node --require ./sentry.js index.js
+    ```
+
+    The `--require` flag is essential — it must patch `http`, `express`, and `mongoose` before they are loaded by `index.js`.
+  </Step>
+  <Step title="Set environment variables">
+    | Variable | Required | Description |
+    |----------|----------|-------------|
+    | `SENTRY_DSN` | yes | Project-specific DSN from your Sentry project settings. |
+    | `SENTRY_TRACES_SAMPLE_RATE` | no | Fraction of transactions to capture for performance monitoring. Defaults to `0.1` (10%). |
+  </Step>
+  <Step title="Verify">
+    Throw a deliberate error from a custom route and confirm it appears in your Sentry project within about 1 minute. The event should carry `reqId`, `userId`, the route, and the user-agent.
+  </Step>
+</Steps>
+
+## OpenTelemetry tracing
+
+OTel auto-instrumentation captures HTTP spans, Mongoose queries, Express middleware, and GraphQL resolver timing without touching any application code.
+
+<Steps>
+  <Step title="Install the SDK">
+    ```bash
+    npm install \
+      @opentelemetry/sdk-node \
+      @opentelemetry/auto-instrumentations-node \
+      @opentelemetry/exporter-trace-otlp-http
+    ```
+  </Step>
+  <Step title="Create telemetry.js at the project root">
+    ```js
+    // telemetry.js
+    const { NodeSDK } = require('@opentelemetry/sdk-node');
+    const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
+    const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
+    const { Resource } = require('@opentelemetry/resources');
+    const { SemanticResourceAttributes } = require('@opentelemetry/semantic-conventions');
+
+    const sdk = new NodeSDK({
+      resource: new Resource({
+        [SemanticResourceAttributes.SERVICE_NAME]: process.env.OTEL_SERVICE_NAME || 'davepi',
+        [SemanticResourceAttributes.SERVICE_VERSION]: process.env.npm_package_version,
+      }),
+      traceExporter: new OTLPTraceExporter({
+        url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://localhost:4318/v1/traces',
+      }),
+      instrumentations: [getNodeAutoInstrumentations()],
+    });
+
+    sdk.start();
+    process.on('SIGTERM', () => sdk.shutdown());
+    ```
+  </Step>
+  <Step title="Boot with --require">
+    ```bash
+    node --require ./telemetry.js index.js
+    ```
+  </Step>
+  <Step title="Configure the exporter">
+    | Variable | Default | Description |
+    |----------|---------|-------------|
+    | `OTEL_SERVICE_NAME` | `davepi` | Service name in your tracing backend. |
+    | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318/v1/traces` | OTLP endpoint. Honeycomb, Jaeger, Tempo, and Datadog all accept OTLP. |
+    | `OTEL_EXPORTER_OTLP_HEADERS` | — | Auth headers, e.g. `x-honeycomb-team=...`. |
+  </Step>
+</Steps>
+
+After a successful setup, a request span looks like:
+
+```
+POST /api/v1/account
+├── mongoose query: account.findOne
+└── mongoose query: account.save
+```
+
+## Picking a stack
+
+| You want | Use |
+|----------|-----|
+| Distributed tracing across services | OpenTelemetry — vendor-neutral, swap the backend freely. |
+| One tool for traces + metrics + logs + errors | Datadog (paid) or Sentry + Prometheus + Loki (OSS). |
+| Self-hosted, OSS only | Prometheus + Grafana for metrics, Sentry self-hosted for errors, OTel + Jaeger or Tempo for traces. |
+| Error reporting only | Sentry. |
+| Metrics only | `METRICS_ENABLED=true` + Prometheus + Grafana. |
+
+<Note>
+  The four integrations above are non-exclusive. You can run OTel for traces, Prometheus for metrics, and Sentry for errors simultaneously. Each adds a small CPU overhead — benchmark before enabling all three on latency-critical paths.
+</Note>
+
+## Grafana and Datadog starter dashboards
+
+Pre-built dashboard JSON files are available in the repository:
+
+- **Grafana**: [`docs/site/public/dashboards/grafana-davepi.json`](https://github.com/projik/davepi/blob/main/docs/site/public/dashboards/grafana-davepi.json) — request rate, p50/p95/p99 latency, error rate, and Node.js runtime metrics per route.
+- **Datadog**: [`docs/site/public/dashboards/datadog-davepi.json`](https://github.com/projik/davepi/blob/main/docs/site/public/dashboards/datadog-davepi.json) — import via _Dashboards → Import_ and adjust the `service:` scope to match your `DD_SERVICE`.
+
+Import either via your tool's dashboard import UI and point it at the Prometheus datasource that scrapes your dAvePi instance.

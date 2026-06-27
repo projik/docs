@@ -1,0 +1,419 @@
+---
+title: "Messaging Plugins — Slack, Postmark & Twilio"
+sidebarTitle: "Messaging"
+description: "Send Slack alerts, transactional email via Postmark, and SMS or WhatsApp messages via Twilio from dAvePi lifecycle hooks and event bus subscribers."
+---
+
+Three first-party plugins handle outbound notifications from your dAvePi app. Each one is dormant until you set its credentials, so you can declare all three in `package.json` before you've wired any of them. Use Slack for internal team alerts, Postmark for transactional email to your users, and Twilio for SMS and WhatsApp. All three integrate with the same record event bus — you can react to any CRUD mutation without touching the schema files.
+
+<Tabs>
+  <Tab title="Slack">
+
+## davepi-plugin-slack
+
+`davepi-plugin-slack` subscribes to the in-process record event bus and posts a formatted message to a Slack incoming webhook for every event whose type matches a configured pattern. It also exposes `postMessage` so a lifecycle hook can fire a custom message inline.
+
+### Install
+
+```bash
+npm install davepi-plugin-slack
+```
+
+```json
+{
+  "davepi": {
+    "plugins": ["davepi-plugin-slack"]
+  }
+}
+```
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `SLACK_WEBHOOK_URL` | yes (else dormant) | — | The full incoming-webhook URL from the Slack app configuration. Must start with `https://`. |
+| `SLACK_EVENTS` | no | *(empty — no auto-forward)* | Comma-separated event patterns. Supports `order.created`, `order.*`, and `*`. |
+| `SLACK_APP_NAME` | no | `APP_NAME` → `"dAvePi"` | Prefix used in every auto-forwarded message. |
+| `SLACK_USERNAME` | no | — | Optional sender name override. |
+| `SLACK_ICON_EMOJI` | no | — | Optional sender icon, e.g. `:robot_face:`. |
+
+### Event patterns
+
+| Pattern | Matches |
+|---------|---------|
+| `order.created` | Exact event type. |
+| `order.*` | Every `order.<verb>` — created, updated, deleted, transitioned. |
+| `*` | Every event the framework emits. |
+
+### Default message format
+
+| Event shape | Example message |
+|-------------|-----------------|
+| Single-record | *my-app* — `order.created` — `66e8b3…` |
+| Bulk mutation | *my-app* — `order.updated` — 42 record(s) affected |
+| State transition | *my-app* — `order.transitioned` — `66e8b3…` — status: draft → approved |
+
+### Call Slack from a lifecycle hook
+
+Use `postMessage` for custom messages with full control over content:
+
+```js
+// schema/versions/v1/order.js
+const slack = require('davepi-plugin-slack');
+
+module.exports = {
+  path: 'order',
+  fields: [
+    { name: 'total',    type: 'Number' },
+    { name: 'customer', type: 'String' },
+  ],
+  hooks: {
+    afterCreate: async ({ record, req }) => {
+      try {
+        if (record.total >= 1000) {
+          await slack.postMessage(
+            `:moneybag: High-value order from ${record.customer} — $${record.total}`
+          );
+        }
+      } catch (err) {
+        (req?.log || console).error({ err }, 'slack alert failed');
+      }
+    },
+  },
+};
+```
+
+### Custom formatter
+
+Override the default message format for richer Slack Block Kit payloads:
+
+```js
+// plugins/my-slack.js
+const { createPlugin } = require('davepi-plugin-slack');
+
+module.exports = createPlugin({
+  formatter: (event, { appName }) => {
+    if (event.type === 'order.created') {
+      return `:tada: [${appName}] New order — $${event.record?.total ?? '?'}`;
+    }
+    return `[${appName}] ${event.type}`;
+  },
+  timeoutMs: 5000,
+});
+```
+
+Register the custom instance instead:
+
+```json
+{
+  "davepi": {
+    "plugins": ["./plugins/my-slack.js"]
+  }
+}
+```
+
+<Note>
+`postMessage` throws if the plugin is dormant (i.e., `SLACK_WEBHOOK_URL` is unset). Wrap calls in `try/catch` inside `after*` hooks — Slack outages should not surface to your users.
+</Note>
+
+  </Tab>
+  <Tab title="Postmark">
+
+## davepi-plugin-postmark
+
+`davepi-plugin-postmark` sends transactional email via Postmark. It exposes `sendEmail` and `sendEmailWithTemplate` (alias: `sendTemplate`) so lifecycle hooks can fire welcome, receipt, or verification emails inline. It optionally subscribes to the record event bus to auto-send a template for every event matching a configured pattern.
+
+### Install
+
+```bash
+npm install davepi-plugin-postmark
+```
+
+```json
+{
+  "davepi": {
+    "plugins": ["davepi-plugin-postmark"]
+  }
+}
+```
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `POSTMARK_SERVER_TOKEN` | yes (else dormant) | — | Server token from your Postmark server's API Tokens tab. |
+| `POSTMARK_FROM` | strongly recommended | — | Default `From` address. Accepts `name@example.com` or `"Acme <name@example.com>"`. |
+| `POSTMARK_REPLY_TO` | no | — | Default `Reply-To` address. Per-call `replyTo` overrides this. |
+| `POSTMARK_MESSAGE_STREAM` | no | Postmark default | Set to your transactional stream ID. |
+| `POSTMARK_APP_NAME` | no | `APP_NAME` → `"dAvePi"` | Surfaced to rule `build()` callbacks as `{ appName }`. |
+
+For inbound email parsing, also set `POSTMARK_INBOUND_PATH` and `POSTMARK_INBOUND_AUTH` (see [Inbound email](#inbound-email) below).
+
+### Send email from a lifecycle hook
+
+```js
+// schema/versions/v1/user.js
+const postmark = require('davepi-plugin-postmark');
+
+module.exports = {
+  path: 'user',
+  fields: [
+    { name: 'email', type: 'String', required: true },
+    { name: 'name',  type: 'String' },
+    { name: 'verifyToken', type: 'String' },
+  ],
+  hooks: {
+    afterCreate: async ({ record, req }) => {
+      try {
+        await postmark.sendEmailWithTemplate({
+          to:            record.email,
+          templateAlias: 'welcome',
+          templateModel: {
+            name:      record.name,
+            verifyUrl: `https://app.example.com/verify/${record.verifyToken}`,
+          },
+        });
+      } catch (err) {
+        (req?.log || console).error({ err }, 'welcome email failed');
+      }
+    },
+  },
+};
+```
+
+### Full API surface
+
+<Accordion title="sendEmail — plain HTML or text email">
+
+```js
+await postmark.sendEmail({
+  to:            'user@example.com',  // or ['a@x.com', 'b@x.com']
+  subject:       'Your receipt',
+  htmlBody:      '<p>Thanks for your order!</p>',
+  textBody:      'Thanks for your order!',
+  from:          'billing@example.com',  // overrides POSTMARK_FROM
+  cc:            'manager@example.com',
+  bcc:           ['ops@example.com'],
+  replyTo:       'support@example.com',
+  tag:           'receipt',
+  metadata:      { plan: 'pro' },
+  trackOpens:    true,
+  trackLinks:    'HtmlOnly',   // 'None' | 'HtmlAndText' | 'HtmlOnly' | 'TextOnly'
+  messageStream: 'outbound',
+});
+```
+
+</Accordion>
+
+<Accordion title="sendEmailWithTemplate — Postmark template">
+
+```js
+await postmark.sendEmailWithTemplate({
+  to:            'user@example.com',
+  templateAlias: 'welcome',           // or templateId: 12345
+  templateModel: { name: 'Alice', verifyUrl: '…' },
+  inlineCss:     true,
+});
+// sendTemplate is a short alias for the same function.
+```
+
+</Accordion>
+
+<Accordion title="sendBatch / sendBatchTemplates — up to 500 per call">
+
+```js
+await postmark.sendBatch([
+  { to: 'a@x.com', subject: 'Hello', textBody: 'Hi A' },
+  { to: 'b@x.com', subject: 'Hello', textBody: 'Hi B' },
+]);
+
+await postmark.sendBatchTemplates([
+  { to: 'a@x.com', templateAlias: 'welcome', templateModel: { name: 'A' } },
+  { to: 'b@x.com', templateAlias: 'welcome', templateModel: { name: 'B' } },
+]);
+```
+
+Batch endpoints return Postmark's array of per-message results unchanged — Postmark allows partial success, so inspect each result for `ErrorCode`.
+
+</Accordion>
+
+### Event-driven auto-send
+
+To send a template on every matching event without adding hooks to every schema, create a custom plugin instance with rules:
+
+```js
+// plugins/welcome-email.js
+const { createPlugin } = require('davepi-plugin-postmark');
+
+module.exports = createPlugin({
+  rules: [
+    {
+      events: 'user.created',
+      build: (event, { appName }) => {
+        const email = event.record?.email;
+        if (!email) return null;  // return null to skip this event
+        return {
+          to:            email,
+          templateAlias: 'welcome',
+          templateModel: { name: event.record.name, app: appName },
+        };
+      },
+    },
+  ],
+});
+```
+
+### Inbound email
+
+Set `POSTMARK_INBOUND_PATH` and `POSTMARK_INBOUND_AUTH` (`user:pass`) to mount an inbound webhook. The plugin validates the Basic auth credentials on every request, ACKs Postmark immediately, then fans out to your registered handlers:
+
+```js
+const postmark = require('davepi-plugin-postmark');
+
+const off = postmark.onInboundEmail(async (msg) => {
+  // msg is Postmark's full InboundMessage object:
+  // { MessageID, From, FromName, To, Subject, TextBody, HtmlBody,
+  //   StrippedTextReply, Attachments, Headers, Date, ... }
+  const ticketId = parseTicketTag(msg.To);
+  if (!ticketId) return;
+  await TicketReply.create({ ticketId, text: msg.StrippedTextReply, from: msg.From });
+});
+// Call off() to unsubscribe.
+```
+
+  </Tab>
+  <Tab title="Twilio SMS">
+
+## davepi-plugin-twilio (messaging mode)
+
+`davepi-plugin-twilio` handles outbound SMS and WhatsApp notifications from lifecycle hooks or custom plugins. For authentication flows (OTP login and TOTP 2FA), see the [Auth Plugins](/plugins/auth) page.
+
+### Install
+
+```bash
+npm install davepi-plugin-twilio
+```
+
+```json
+{
+  "davepi": {
+    "plugins": ["davepi-plugin-twilio"]
+  }
+}
+```
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `TWILIO_ACCOUNT_SID` | yes (else dormant) | — | Twilio account SID from the console. |
+| `TWILIO_AUTH_TOKEN` | yes | — | Twilio auth token. Also verifies inbound webhook signatures. |
+| `TWILIO_FROM_NUMBER` | yes for SMS | — | Sender in E.164 format, e.g. `+15005550006`. |
+| `TWILIO_MESSAGING_SERVICE_SID` | no | — | Takes precedence over `TWILIO_FROM_NUMBER` when set. |
+| `TWILIO_WHATSAPP_FROM` | yes for WhatsApp | — | Sender in `whatsapp:+…` format. |
+| `TWILIO_INBOUND_PATH` | no | *(off)* | Mount path for the inbound SMS webhook. Leave unset to disable. |
+| `TWILIO_APP_NAME` | no | `APP_NAME` → `"dAvePi"` | Prefix used in SMS bodies. |
+
+### Send SMS from a lifecycle hook
+
+```js
+// schema/versions/v1/order.js
+const twilio = require('davepi-plugin-twilio');
+
+module.exports = {
+  path: 'order',
+  fields: [
+    { name: 'customerPhone', type: 'String' },
+    { name: 'code',          type: 'String' },
+  ],
+  hooks: {
+    afterCreate: async ({ record, req }) => {
+      try {
+        await twilio.sendSms({
+          to:   record.customerPhone,
+          body: `Order ${record.code} received. We'll notify you when it ships.`,
+        });
+      } catch (err) {
+        (req?.log || console).error({ err }, 'order SMS failed');
+      }
+    },
+  },
+};
+```
+
+### Send WhatsApp
+
+Pass a plain text body or use a Twilio Content template:
+
+```js
+// Plain text
+await twilio.sendWhatsApp({
+  to:   '+15555550100',   // whatsapp: prefix is added automatically if absent
+  body: 'Your order has shipped!',
+});
+
+// Content template
+await twilio.sendWhatsApp({
+  to:          '+15555550100',
+  templateSid: 'HXabcdef…',
+  variables:   { 1: 'Alice', 2: 'ORD-42' },
+});
+```
+
+### Inbound SMS webhook
+
+Set `TWILIO_INBOUND_PATH` to the path you configured in the Twilio console. The plugin validates the `X-Twilio-Signature` header on every request, ACKs with an empty TwiML `<Response/>`, then fans out to your handlers:
+
+```js
+const twilio = require('davepi-plugin-twilio');
+
+twilio.onInboundSms(async (msg) => {
+  // msg carries parsed Twilio fields:
+  // { MessageSid, From, To, Body, NumMedia, MediaUrl0, ... }
+  await routeMessageToTicket(msg.Body, msg.From);
+});
+```
+
+<Note>
+Set `TRUST_PROXY=true` in your dAvePi environment if the app runs behind a reverse proxy. The inbound handler reconstructs the full request URL from forwarded headers for Twilio signature validation — the headers must be trusted for the signature to match.
+</Note>
+
+### Slack alert on high-value order (complete example)
+
+This example shows Slack and Twilio working together from a single `afterCreate` hook:
+
+```js
+// schema/versions/v1/order.js
+const slack  = require('davepi-plugin-slack');
+const twilio = require('davepi-plugin-twilio');
+
+module.exports = {
+  path: 'order',
+  fields: [
+    { name: 'total',         type: 'Number' },
+    { name: 'customerPhone', type: 'String' },
+    { name: 'customerEmail', type: 'String' },
+  ],
+  hooks: {
+    afterCreate: async ({ record, req }) => {
+      const log = req?.log || console;
+      try {
+        if (record.total >= 500) {
+          await slack.postMessage(
+            `:moneybag: Order over $${record.total} from ${record.customerEmail}`
+          );
+        }
+        await twilio.sendSms({
+          to:   record.customerPhone,
+          body: `Your order of $${record.total} is confirmed!`,
+        });
+      } catch (err) {
+        log.error({ err, orderId: record._id }, 'order notification failed');
+      }
+    },
+  },
+};
+```
+
+  </Tab>
+</Tabs>

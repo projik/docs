@@ -1,0 +1,240 @@
+---
+title: "Error Codes and Response Shapes in dAvePi"
+sidebarTitle: "Errors"
+description: "Every typed error code dAvePi returns, with HTTP status, error envelope shape, GraphQL and MCP variants, and fix guidance."
+---
+
+dAvePi returns a consistent error envelope across every surface — REST, GraphQL, MCP, and the typed client. Read `code` in your code; read `message` as a human. The `code` field is part of the stability contract and will not change without a major version bump. `message` is human-readable prose and may vary across versions.
+
+## Standard error envelope
+
+Every error response, regardless of surface, wraps the same shape:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION",
+    "message": "Validation failed: amount: Path `amount` is required.",
+    "details": { }
+  }
+}
+```
+
+## How errors surface per interface
+
+<Tabs>
+  <Tab title="REST">
+    The response body is the error envelope above. The HTTP status code maps to the error code — see the catalogue below.
+
+    ```json
+    HTTP/1.1 400 Bad Request
+
+    {
+      "error": {
+        "code": "VALIDATION",
+        "message": "Validation failed: stage: `won` is not a valid enum value.",
+        "details": {
+          "fields": {
+            "stage": "`won` is not a valid enum value for path `stage`."
+          }
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="GraphQL">
+    Errors appear in the top-level `errors` array. The `code` and `details` live in `extensions`.
+
+    ```json
+    {
+      "data": null,
+      "errors": [
+        {
+          "message": "Validation failed: amount: Path `amount` is required.",
+          "extensions": {
+            "code": "VALIDATION",
+            "details": {
+              "fields": { "amount": "Path `amount` is required." }
+            }
+          }
+        }
+      ]
+    }
+    ```
+  </Tab>
+  <Tab title="MCP">
+    Errors use the MCP structured error shape. Branch on `code` inside the serialised JSON — agents should never parse `text` as a signal.
+
+    ```json
+    {
+      "isError": true,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"code\":\"NOT_FOUND\",\"message\":\"account not found\",\"details\":{}}"
+        }
+      ]
+    }
+    ```
+
+    The `recoverable` field in the MCP payload tells agents whether to retry after correcting input (`true`) or treat the error as a structural mismatch (`false`).
+  </Tab>
+  <Tab title="Typed client">
+    The TypeScript client throws a `DavepiError` with the same shape:
+
+    ```ts
+    try {
+      await client.account.create({ name: '' });
+    } catch (err) {
+      if (err instanceof DavepiError) {
+        console.log(err.status);  // 400
+        console.log(err.code);    // "VALIDATION"
+        console.log(err.details); // { fields: { name: "..." } }
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Error code catalogue
+
+| Code | HTTP | Recoverable | When it happens |
+|------|------|-------------|-----------------|
+| `VALIDATION` | 400 | yes | Mongoose or framework validation failed. `details.fields` carries per-field reasons. |
+| `INVALID_ID` | 400 | yes | A path parameter looks like an ObjectId but is not valid. |
+| `INVALID_TRANSITION` | 400 | yes | A state-machine field was set to a value not in `transitions[current]`. `details` carries `field`, `current`, `attempted`, and `allowed`. |
+| `UNAUTHORIZED` | 401 | usually | Missing, invalid, or expired Bearer token. The MCP variant carries `auth: true` so clients can refresh. |
+| `FORBIDDEN` | 403 | no | Valid token but the caller's role is not permitted for this action (e.g. calling an `unsafe` aggregation without the `acl.list` role). |
+| `NOT_FOUND` | 404 | no | Resource does not exist for this caller. Cross-tenant reads also return 404 — existence is not disclosed to the wrong tenant. |
+| `METHOD_NOT_ALLOWED` | 405 | no | HTTP verb is not supported on this path. |
+| `CONFLICT` | 409 | no | Generic conflict. |
+| `DUPLICATE` | 409 | sometimes | MongoDB unique-index violation. `details` carries the duplicate `field` and `value`. Recoverable if you can pick a different value. |
+| `IDEMPOTENCY_CONFLICT` | 409 | no | `Idempotency-Key` was reused with a different request body. Pick a new key. |
+| `IDEMPOTENCY_IN_PROGRESS` | 409 | yes | A concurrent retry hit while the first call was still running. Wait briefly and retry under the same key. |
+| `RATE_LIMITED` | 429 | yes | Rate limiter tripped. Retry after the `Retry-After` response header value. |
+| `INTERNAL` | 500 | no | Unknown server error. In production, `message` is reduced to `"Internal server error"` — the real error is in the server log under the request's `reqId`. |
+
+## `details` shapes per code
+
+<Accordion title="VALIDATION">
+  ```json
+  {
+    "details": {
+      "fields": {
+        "amount": "Path `amount` is required.",
+        "stage":  "`won` is not a valid enum value for path `stage`."
+      }
+    }
+  }
+  ```
+  Iterate `details.fields` to display per-field error messages in a form.
+</Accordion>
+
+<Accordion title="INVALID_TRANSITION">
+  ```json
+  {
+    "details": {
+      "field":     "status",
+      "current":   "review",
+      "attempted": "archived",
+      "allowed":   ["approved", "rejected"]
+    }
+  }
+  ```
+  Use `details.allowed` to present valid next states in your UI.
+</Accordion>
+
+<Accordion title="DUPLICATE">
+  ```json
+  {
+    "details": {
+      "field": "slug",
+      "value": "acme"
+    }
+  }
+  ```
+  `details.field` tells you which field caused the conflict so you can prompt the user to pick a different value.
+</Accordion>
+
+<Accordion title="IDEMPOTENCY_CONFLICT">
+  ```json
+  {
+    "details": {
+      "originalBodyHash":  "5c6f...",
+      "submittedBodyHash": "8a3e..."
+    }
+  }
+  ```
+  The body you submitted does not match the body originally sent under this `Idempotency-Key`. Generate a fresh key for the new request.
+</Accordion>
+
+<Accordion title="RATE_LIMITED">
+  ```json
+  {
+    "details": {
+      "retryAfterSeconds": 30
+    }
+  }
+  ```
+  Both `details.retryAfterSeconds` and the `Retry-After` HTTP response header are populated. Honour either one.
+</Accordion>
+
+## Production error reduction
+
+In `NODE_ENV=production`, any error that is not a typed `AppError` subclass is reduced before it reaches the wire:
+
+```json
+{ "error": { "code": "INTERNAL", "message": "Internal server error" } }
+```
+
+The real error is logged at `error` level with the request's `reqId`. Use that ID to correlate the response your user saw with the server log line.
+
+<Warning>
+  Never write `res.status(500).send(err.message)` in custom routes. That leaks stack traces and internal paths to the wire. Throw a typed error or let `asyncHandler` forward the rejection to the central `errorHandler`.
+</Warning>
+
+## Throwing typed errors from custom routes
+
+Use the typed error classes so the `errorHandler` formats the envelope correctly — never construct the envelope yourself.
+
+```js
+const { NotFoundError, ValidationError } = require('./utils/errors');
+
+app.get('/api/v1/foo/:id/custom', auth(true), asyncHandler(async (req, res) => {
+  const doc = await Foo.findOne({ _id: req.params.id, userId: req.user.user_id });
+  if (!doc) throw new NotFoundError('foo');
+  if (!doc.canFrobnicate) throw new ValidationError('foo cannot be frobnicated');
+  res.json(doc);
+}));
+```
+
+`asyncHandler` forwards any rejection to the terminal `errorHandler`, which formats the envelope, sets the status code, and ensures consistency with every auto-generated route.
+
+## Common errors and how to fix them
+
+<CardGroup cols={2}>
+  <Card title="400 VALIDATION" icon="triangle-exclamation">
+    Check `details.fields` for per-field messages. Ensure required fields are present and enum values are in the allowed set.
+  </Card>
+  <Card title="401 UNAUTHORIZED" icon="key">
+    Verify your `Authorization: Bearer <token>` header is present and the token has not expired. The default TTL is 15 minutes for access tokens.
+  </Card>
+  <Card title="403 FORBIDDEN" icon="ban">
+    Your token is valid but your role is not in the `acl` list for this action. Contact your admin or check the schema's `acl` configuration.
+  </Card>
+  <Card title="404 NOT_FOUND" icon="magnifying-glass">
+    The record either does not exist or belongs to a different tenant. dAvePi intentionally returns 404 for cross-tenant reads to avoid disclosing existence.
+  </Card>
+  <Card title="409 DUPLICATE" icon="copy">
+    A unique index was violated. Check `details.field` and prompt the user to choose a different value.
+  </Card>
+  <Card title="422 INVALID_TRANSITION" icon="arrows-rotate">
+    The state-machine transition is not permitted from the current state. Check `details.allowed` for valid next states.
+  </Card>
+  <Card title="429 RATE_LIMITED" icon="clock">
+    Back off for the duration in `Retry-After` (or `details.retryAfterSeconds`) and then retry.
+  </Card>
+  <Card title="500 INTERNAL" icon="server">
+    Capture the `x-request-id` response header and share it with your platform logs to find the real error. Do not retry automatically.
+  </Card>
+</CardGroup>

@@ -1,0 +1,154 @@
+---
+title: "Schema Migrations: Backfilling Existing Records"
+sidebarTitle: "Migrations"
+description: "When you need a migration, when you don't, how to write and run one, and the expand-migrate-contract pattern for zero-downtime changes."
+---
+
+MongoDB is schemaless, so most schema changes in dAvePi require nothing from you — restart the server and the new schema loads automatically. Migrations exist only for changes that need to touch existing rows: renaming a field, splitting a column, coercing old values to a new enum, and similar data backfills. If your change doesn't touch existing data, you don't need a migration.
+
+## When you do and don't need a migration
+
+| Change | Action needed |
+|--------|---------------|
+| Add a new field with a default | Restart the server. Mongoose stamps the default on new writes; old rows return `undefined` (or `null`) for the field until they are next saved. |
+| Add a new field without a default | Restart. Old records return the field as `null`. |
+| Add or change a `default` | Restart. Existing rows are unaffected unless you backfill. |
+| Add a new index | Restart. Mongoose builds the index in the background at boot. |
+| Add an aggregation or computed field | Restart. No data to backfill. |
+| Remove a field from the schema | Restart. The field's data stays in MongoDB until you clean it up. The API no longer exposes it. |
+| **Rename a field** | **Migration required.** Copy values from the old key to the new, then unset the old. Use expand-migrate-contract (see below). |
+| **Add a state machine to an existing field** | **Migration required** if existing rows hold values not in `states[]`. The framework refuses to compute `availableTransitions` for rows whose current value is unknown. |
+| **Split a field into two** | **Migration required.** Expand, backfill, then contract. |
+| **Compute a denormalised value across existing rows** | **Migration required.** |
+
+## Anatomy of a migration file
+
+Create a JS file in `migrations/`. The filename determines sort order — use `YYYY-MM-DD-<slug>` by convention.
+
+```js
+// migrations/2026-05-01-add-account-region.js
+module.exports = {
+  name: '2026-05-01-add-account-region',
+  description: 'Backfill account.region from country code.',
+
+  async up({ models, log }) {
+    const { Account } = models;
+    const cursor = Account.find({ region: { $exists: false } }).cursor();
+    let updated = 0;
+    for await (const doc of cursor) {
+      doc.region = inferRegion(doc.countryCode);
+      await doc.save();
+      updated++;
+    }
+    log.info({ updated }, 'backfill complete');
+  },
+
+  async down({ models }) {
+    await models.Account.updateMany({}, { $unset: { region: '' } });
+  },
+};
+```
+
+| Key | Description |
+|-----|-------------|
+| `name` | Unique identifier. Convention: `YYYY-MM-DD-<short-slug>`. The migration runner keys idempotency on this value. |
+| `description` | One-liner shown by `davepi migrate status`. |
+| `up({ models, log, db })` | Forward migration. `models` carries every Mongoose model for every loaded schema. |
+| `down({ models, log, db })` | Reverse migration. Best-effort — some operations have no clean inverse. Always snapshot before running `down`. |
+
+## Running migrations
+
+```bash
+# Run all pending migrations against the configured MONGO_URI.
+npx davepi migrate up
+
+# Run one specific migration by name.
+npx davepi migrate up --name 2026-05-01-add-account-region
+
+# Reverse the most recent applied migration.
+npx davepi migrate down
+
+# Show status of all migrations (pending / succeeded / failed).
+npx davepi migrate status
+```
+
+The CLI connects to MongoDB using the same `MONGO_URI` as the app, loads the full schema registry so `models` is populated, and reads `migrations/` in alphabetical order. It skips any migration whose `name` already appears in the `_migrations` collection with status `succeeded`.
+
+<Warning>
+  Always take a MongoDB snapshot before running a migration — especially before `migrate down`. See [Backup](/operations/backup) for snapshot procedures. A migration runner failure leaves the row marked `failed` in `_migrations` so the CLI surfaces the error on the next run rather than silently skipping it.
+</Warning>
+
+## Writing idempotent migrations
+
+Each migration runs at most once. But for large backfills that may be interrupted (network blip, timeout, process killed), write `up` so it is safe to resume: scope the query to only rows that haven't been touched yet.
+
+```js
+async up({ models }) {
+  // Safe to run again after a partial failure — only processes rows
+  // where region hasn't been set yet.
+  const cursor = models.Account.find({ region: { $exists: false } }).cursor();
+  for await (const doc of cursor) {
+    doc.region = inferRegion(doc.countryCode);
+    await doc.save();
+  }
+},
+```
+
+This pattern means a partial run can resume from where it stopped on the next invocation without doubling up on already-migrated rows.
+
+## The expand-migrate-contract pattern
+
+Use this three-step pattern for changes that touch existing rows AND existing reads, to maintain a working application throughout.
+
+<Steps>
+  <Step title="Expand — ship code that handles both shapes">
+    Add the new field to the schema. Make it optional. Update write paths to populate both the old field and the new field. Update read paths to fall back to the old field if the new one is absent.
+
+    Deploy this. New records are written in the new shape. Old records still work because reads fall back gracefully.
+  </Step>
+  <Step title="Migrate — backfill old rows">
+    Run the migration to copy values from the old field to the new field across all existing rows.
+
+    ```bash
+    npx davepi migrate up --name <your-migration>
+    ```
+
+    After this step, every row has the new field.
+  </Step>
+  <Step title="Contract — remove the back-compat shim">
+    Update write paths to only populate the new field. Update read paths to only read the new field. Remove the old field from the schema.
+
+    Deploy this. The old field's data stays in MongoDB until you clean it up, but the API no longer exposes it.
+  </Step>
+</Steps>
+
+Each step is a separate deploy. Each step works with the row state left by the previous step, so partial rollouts and rollbacks are safe.
+
+## Running migrations in a deploy pipeline
+
+The migration CLI exits non-zero on any failure, which halts a CI pipeline before the contract deploy runs.
+
+```yaml
+# Example GitHub Actions step (between expand and contract deploys)
+- name: Run migrations
+  run: npx davepi migrate up
+  env:
+    MONGO_URI: ${{ secrets.MONGO_URI }}
+    NODE_ENV: production
+```
+
+<Tip>
+  Test migrations on a staging database that mirrors production data before running against production. A staging run surfaces data-shape surprises — missing fields, unexpected value distributions, index conflicts — without risk to live data.
+</Tip>
+
+## Staging best practice
+
+Before running any migration in production:
+
+1. Take a snapshot of the production database.
+2. Restore the snapshot to your staging environment.
+3. Run `npx davepi migrate up` against staging.
+4. Verify the application works correctly with the migrated data.
+5. Run the migration against production.
+
+This drill also validates your restore procedure — a bonus that matters when you actually need it at 3am.

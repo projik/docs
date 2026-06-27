@@ -1,0 +1,304 @@
+---
+title: "Background Jobs & Scheduled Tasks — Queue and Cron"
+sidebarTitle: "Jobs & Queues"
+description: "Offload slow work with durable BullMQ job queues and run recurring tasks with Mongo-backed distributed cron — both survive server restarts and multi-server deploys."
+---
+
+Two plugins cover background work in dAvePi. `davepi-plugin-queue` gives you durable job queues for slow work that shouldn't block a request — email sends, PDF generation, third-party API calls. `davepi-plugin-cron` gives you declarative scheduled jobs that fire on a cron expression and are safe to run across multiple servers without double-executing. Both plugins are independent and can run together in the same app.
+
+## davepi-plugin-queue
+
+`after*` lifecycle hooks run synchronously to the HTTP request. That's correct for fast in-process side effects, but wrong the moment a hook needs to call Postmark, hit Stripe, or generate a report. `davepi-plugin-queue` adds a `bus.emit('job:enqueue', ...)` channel — or a direct `enqueue()` import — that returns immediately, persists the job in Redis via BullMQ, and retries with exponential backoff on failure. Jobs survive process restarts.
+
+### Install
+
+```bash
+npm install davepi-plugin-queue
+```
+
+You also need Redis. Heroku Key-Value Store, Upstash, AWS ElastiCache, Fly.io's Redis add-on, and self-hosted `redis-server` all work.
+
+```json
+{
+  "davepi": {
+    "plugins": [
+      "davepi-plugin-postmark",
+      "davepi-plugin-queue",
+      "./plugins/welcome-handler.js"
+    ]
+  }
+}
+```
+
+The plugin is dormant until `QUEUE_REDIS_URL` is set — safe to declare before wiring Redis.
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `QUEUE_REDIS_URL` | yes (else dormant) | — | `redis://` or `rediss://` connection string. |
+| `QUEUE_NAME` | no | `davepi` | BullMQ queue name. Use distinct names when multiple apps share a Redis instance. |
+| `QUEUE_CONCURRENCY` | no | `5` | Per-worker concurrency. |
+| `QUEUE_WORKER` | no | `true` | Set to `false` on web dynos to enqueue-only; set to `true` on worker dynos. |
+| `QUEUE_PREFIX` | no | `bull` | BullMQ key prefix in Redis. |
+| `QUEUE_STATUS_PATH` | no | `/api/jobs` | Status endpoint path. Empty string disables it. |
+| `QUEUE_FAILED_TTL` | no | forever | How long failed jobs are retained. Accepts `7d`, `12h`, `30m`, `60s`, or ms. |
+
+### Enqueue a job from a hook
+
+Call `queue.enqueue(name, data, opts)` from any `after*` hook. Pass `{ user: req.user }` in `opts` to stamp tenancy:
+
+```js
+// schema/versions/v1/user.js
+const queue = require('davepi-plugin-queue');
+
+module.exports = {
+  path: 'user',
+  fields: [
+    { name: 'email', type: 'String', required: true },
+    { name: 'name',  type: 'String' },
+  ],
+  hooks: {
+    afterCreate: async ({ record, user }) => {
+      await queue.enqueue(
+        'send-welcome',
+        { email: record.email, name: record.name },
+        { user, attempts: 5, backoff: { type: 'exponential', delay: 2000 } }
+      );
+    },
+  },
+};
+```
+
+<Note>
+Pass plain objects — not Mongoose documents — to `enqueue`. BullMQ JSON-serialises the payload in Redis; Mongoose documents have internal state that doesn't round-trip. Use `record.toObject()` or pick the fields you need.
+</Note>
+
+### Define a worker handler
+
+Register the worker side in a dedicated plugin so the handler code is separate from the schema:
+
+```js
+// plugins/welcome-handler.js
+const queue    = require('davepi-plugin-queue');
+const postmark = require('davepi-plugin-postmark');
+
+module.exports = {
+  name: 'welcome-handler',
+  async setup({ log }) {
+    queue.registerJob('send-welcome', async (data, { attempt, log: jobLog }) => {
+      jobLog.info({ attempt, email: data.email }, 'sending welcome email');
+      await postmark.sendEmailWithTemplate({
+        to:            data.email,
+        templateAlias: 'welcome',
+        templateModel: { name: data.name },
+      });
+    });
+  },
+};
+```
+
+`POST /api/user` now returns immediately. The Postmark call runs in the background, retries up to five times with exponential backoff, and completes within seconds.
+
+### Enqueue without importing the plugin
+
+If you don't want to import `davepi-plugin-queue` inside a schema file, emit on the framework's bus instead:
+
+```js
+hooks: {
+  afterCreate: async ({ record, user, req }) => {
+    req.app.locals.bus.emit('job:enqueue', {
+      name: 'send-welcome',
+      data: { email: record.email, name: record.name },
+      opts: { user, attempts: 5 },
+    });
+  },
+}
+```
+
+The plugin subscribes to the same bus and picks up the event. This keeps schema files decoupled from the queue plugin — the emit is a no-op when the queue is dormant.
+
+### Rule-based auto-enqueue
+
+Subscribe to record events and auto-enqueue a job per match, without touching schema files:
+
+```js
+// plugins/order-processing.js
+const { createPlugin } = require('davepi-plugin-queue');
+
+module.exports = createPlugin({
+  rules: [
+    {
+      events: 'order.created',
+      build: (event) => ({
+        name: 'capture-payment',
+        data: { orderId: event.recordId, amount: event.record.total },
+      }),
+    },
+    {
+      events: 'user.*',
+      build: (event) => {
+        if (!event.record?.email) return null;  // return null to skip
+        return {
+          name: 'audit-user-change',
+          data: { userId: event.userId, change: event.type },
+        };
+      },
+    },
+  ],
+});
+```
+
+### Job status endpoint
+
+`GET /api/jobs/:id` returns the job's current state. The route is authenticated and tenant-scoped — a cross-tenant job ID returns `404`, not `403`.
+
+```json
+{
+  "id":          "1234",
+  "name":        "send-welcome",
+  "status":      "completed",
+  "attempts":    1,
+  "lastError":   null,
+  "returnValue": null,
+  "progress":    0
+}
+```
+
+### Web and worker dyno split
+
+As load grows, split the enqueuer and worker into separate dynos:
+
+| Dyno | `QUEUE_WORKER` |
+|------|----------------|
+| web | `false` |
+| worker | `true` (default) |
+
+Both processes load the same plugins with the same `QUEUE_REDIS_URL`. The web dyno only enqueues and serves `/api/jobs/:id`; the worker dyno processes jobs.
+
+---
+
+## davepi-plugin-cron
+
+`davepi-plugin-cron` runs scheduled jobs on a cron expression. The naive `node-cron` approach runs the same job on every server in a cluster. This plugin pairs [`croner`](https://github.com/Hexagon/croner) with a Mongo-backed distributed lock so exactly one server fires per tick — no Redis required. Crashed lock holders are swept by a TTL index; long-running jobs heartbeat-extend their lease and receive an `AbortSignal` when the lease is lost.
+
+### Install
+
+```bash
+npm install davepi-plugin-cron
+```
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `CRON_ENABLED` | no | `true` | Set to `false` on web dynos if you only want cron on a worker dyno. |
+| `CRON_STATUS_PATH` | no | `/api/cron` | Status and manual-trigger endpoint path. Empty string disables. |
+| `CRON_DEFAULT_TZ` | no | `UTC` | Default timezone for jobs that don't specify one. |
+| `CRON_LEASE_SECONDS` | no | `300` | Default lock lease lifetime. Tune to at least 2× your longest expected job duration. |
+
+### Declare jobs in package.json
+
+Add a `davepi.cron` block alongside `davepi.plugins`:
+
+```json
+{
+  "davepi": {
+    "plugins": ["davepi-plugin-cron"],
+    "cron": {
+      "nightly-export": {
+        "schedule": "0 2 * * *",
+        "handler":  "./jobs/nightly-export.js"
+      },
+      "reap-pending": {
+        "schedule": "*/10 * * * *",
+        "handler":  "./jobs/reap-pending.js"
+      },
+      "digest-emails": {
+        "schedule": "0 8 * * 1",
+        "handler":  "./jobs/digest.js",
+        "timezone": "America/New_York"
+      }
+    }
+  }
+}
+```
+
+### Write a handler
+
+Each handler file exports a function. Check the `signal` on long-running jobs to stop cooperatively if the distributed lease is lost:
+
+```js
+// jobs/nightly-export.js
+module.exports = async ({ log, signal, now, name }) => {
+  log.info({ job: name }, 'nightly export starting');
+
+  for await (const batch of streamAllRecords()) {
+    if (signal.aborted) {
+      log.warn({ job: name }, 'aborting: lease lost to another server');
+      return;
+    }
+    await writeBatch(batch);
+  }
+
+  log.info({ job: name }, 'nightly export complete');
+};
+```
+
+### Register jobs programmatically
+
+For dynamic schedules (one job per active tenant, for example), register at boot from your own plugin:
+
+```js
+const cron = require('davepi-plugin-cron');
+
+cron.register('per-tenant-rollup', {
+  schedule:     '0 1 * * *',
+  handler:      async ({ log }) => { /* … */ },
+  timezone:     'UTC',
+  leaseSeconds: 600,
+});
+
+// Hot-reload friendly — remove a job without restarting:
+cron.unregister('per-tenant-rollup');
+```
+
+### Status and manual-trigger endpoints
+
+Both routes require an `admin` role on the caller's JWT.
+
+`GET /api/cron` lists all registered jobs:
+
+```json
+{
+  "jobs": [
+    {
+      "name":           "nightly-export",
+      "schedule":       "0 2 * * *",
+      "timezone":       "UTC",
+      "leaseSeconds":   300,
+      "nextRun":        "2026-05-29T02:00:00.000Z",
+      "lastRun":        "2026-05-28T02:00:00.000Z",
+      "lastStatus":     "ok",
+      "lastDurationMs": 18342,
+      "runCount":       42,
+      "failCount":      0
+    }
+  ]
+}
+```
+
+`POST /api/cron/:name/run-now` triggers a manual tick, useful for backfills:
+
+```json
+{ "ok": true, "acquired": true }
+```
+
+## Choosing between queue and cron
+
+| Situation | Use |
+|-----------|-----|
+| You don't have Redis yet | `davepi-plugin-cron` (uses the existing Mongo connection) |
+| You need retries, DLQ, and per-job observability for scheduled work | `davepi-plugin-queue` with `registerJob` + `repeat: { pattern }` |
+| You want an operator-visible status dashboard without extra tooling | `davepi-plugin-cron` (`GET /api/cron`) |
+| You need both ad-hoc jobs and scheduled recurrence | Use both plugins together |

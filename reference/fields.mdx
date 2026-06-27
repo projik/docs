@@ -1,0 +1,218 @@
+---
+title: "Field Options: Every Key in a fields[] Entry"
+sidebarTitle: "Field Options"
+description: "Complete reference for dAvePi field definitions — types, validation, indexing, ACL, computed fields, state machines, and file uploads."
+---
+
+A field is the smallest unit of schema in dAvePi. The loader reads each entry in `fields[]` and writes Mongoose options, GraphQL types, Swagger fragments, MCP tool input schemas, and admin SPA form descriptors from it — all from the same object. Two keys are always required: `name` and `type`. Everything else is optional.
+
+## Anatomy of a field
+
+```js
+{
+  name:        'amount',
+  type:        Number,
+  required:    true,
+  default:     0,
+  min:         0,
+  searchable:  false,
+  description: 'Deal value in cents.',
+}
+```
+
+## Supported types
+
+Pass a Mongoose type constructor, the string `'File'`, or wrap any of these in an array for a multi-value field.
+
+| Type | Example |
+|------|---------|
+| `String` | `type: String` |
+| `Number` | `type: Number` |
+| `Boolean` | `type: Boolean` |
+| `Date` | `type: Date` |
+| `mongoose.Schema.Types.ObjectId` | `type: mongoose.Schema.Types.ObjectId` |
+| `mongoose.Schema.Types.Mixed` | `type: mongoose.Schema.Types.Mixed` |
+| `'File'` | `type: 'File'` — triggers the file upload pipeline |
+| Array variants | `type: [String]`, `type: [Number]`, etc. |
+
+## Core keys
+
+<ParamField path="name" type="string" required>
+  Becomes the Mongoose path, the GraphQL field name, and the JSON key in responses. Use camelCase by convention.
+</ParamField>
+
+<ParamField path="type" type="Mongoose type or array" required>
+  Any supported Mongoose type constructor, `'File'`, or an array variant. See the table above.
+</ParamField>
+
+<ParamField path="required" type="boolean">
+  Mongoose-level required validation. Missing values return a `400 VALIDATION` error.
+</ParamField>
+
+<ParamField path="default" type="any | function">
+  Mongoose default. Pass a function to evaluate a fresh value per document (e.g. `default: () => new Date()`).
+</ParamField>
+
+<ParamField path="description" type="string">
+  Surfaces in Swagger, `_describe`, and the generated TypeScript client as a doc comment.
+</ParamField>
+
+<ParamField path="deprecated" type="boolean">
+  Hides the field from the admin SPA's default form and marks the GraphQL field `@deprecated`.
+</ParamField>
+
+## Validation keys
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `min` / `max` | number \| Date | Numeric or date range constraint. |
+| `minLength` / `maxLength` | number | String length bounds. |
+| `match` | RegExp | String regex check. |
+| `enum` | array | Restrict the value to an exact set. Surfaces as a literal union in the typed client and a `<select>` in the admin SPA. |
+| `validate` | function \| `{ validator, message }` | Mongoose-style custom validator. Failures return `400 VALIDATION` with `recoverable: true`. |
+| `trim` / `lowercase` / `uppercase` | boolean | String normalizers applied before persistence. |
+
+## Indexing and uniqueness
+
+| Key | Description |
+|-----|-------------|
+| `index` | `true` creates a single-field Mongoose index. For multi-field indexes, use [`compositeIndex`](/reference/schema#compositeindex) at the schema level. |
+| `unique` | **Avoid for tenant-scoped uniqueness.** `unique: true` creates a *global* index that crosses tenants. Use a `compositeIndex: [{ userId: 1, name: 1 }]` instead. |
+| `searchable` | `true` joins this field to the schema's full-text index, enables the `q` query param on the list endpoint, and generates a `search_<path>` MCP tool. |
+
+## Computed fields
+
+Computed fields are calculated at response time and never stored in MongoDB. They are read-only across every surface — POST / PUT bodies and GraphQL input types strip them server-side.
+
+```js
+{
+  name: 'isOverdue',
+  type: Boolean,
+  computed: (record) => record.dueDate && record.dueDate < new Date(),
+}
+```
+
+<ParamField path="computed" type="function">
+  A pure (or async) function of `(record, ctx)`. The return value is appended to the response and the GraphQL output type, but never written to Mongo.
+</ParamField>
+
+## State machine
+
+Add a state machine to any `String` field to get validated transitions, `availableTransitions` on every read, a typed `<path>Transition<Field>` GraphQL mutation, and a `transition<Field>` method on the typed client.
+
+```js
+{
+  name: 'status',
+  type: String,
+  stateMachine: {
+    initial: 'draft',
+    states: ['draft', 'review', 'approved', 'rejected', 'archived'],
+    transitions: {
+      draft:    ['review', 'archived'],
+      review:   ['approved', 'rejected'],
+      approved: ['archived'],
+      rejected: ['draft'],
+    },
+    onEnter: {
+      approved: async (record, ctx) => { /* side-effect */ },
+    },
+  },
+}
+```
+
+| Key | Description |
+|-----|-------------|
+| `initial` | Stamped server-side on POST. Clients cannot pick a non-initial state on create. |
+| `states` | Required. The full set of allowed values. Becomes a literal union in the typed client. |
+| `transitions` | Map of `current → allowed nexts`. Any change not listed returns `400 INVALID_TRANSITION` with `current`, `attempted`, and `allowed` in the body. |
+| `onEnter` | Map of `state → async function(record, ctx)`. Runs once on arrival; errors are logged but don't fail the mutation. |
+
+<Note>
+  Validate a state-machine move with `PUT /api/v1/<path>/:id` and `{ "<field>": "<to>" }` — there is no dedicated transition route on REST. The `<path>Transition<Field>` GraphQL mutation is the typed shortcut.
+</Note>
+
+## File fields
+
+Use `type: 'File'` to trigger the file upload pipeline. The framework generates one upload route, one fetch route, and one delete route per file field, plus matching MCP tools and typed client methods. The field stores a `FileMeta` sub-document — never a raw blob in MongoDB.
+
+```js
+{
+  name: 'logo',
+  type: 'File',
+  file: {
+    maxBytes:   5 * 1024 * 1024,          // 5 MB
+    accept:     ['image/png', 'image/jpeg'],
+    storage:    'local',                   // or 's3'
+    visibility: 'private',                 // 'public' for direct CDN URLs
+  },
+}
+```
+
+| Key under `file` | Description |
+|------------------|-------------|
+| `maxBytes` | Hard upload limit. Defaults to 10 MB. |
+| `accept` | Array of allowed MIME types. The server validates the wire-level type before storage. |
+| `storage` | `'local'` (files stored under `UPLOADS_DIR`) or `'s3'`. |
+| `visibility` | `'public'` for stable CDN URLs; `'private'` (default) for short-lived signed URLs on each read. |
+
+## Field-level ACL
+
+Restrict read and write access to specific roles. The projection runs on REST, GraphQL, MCP responses, webhook payloads, and audit-log diffs — no surface bypasses it.
+
+```js
+{
+  name: 'salary',
+  type: Number,
+  acl: {
+    read:   ['admin', 'hr'],  // only these roles see this field on reads
+    create: ['admin', 'hr'],  // only these roles can supply the field on POST
+    update: ['admin', 'hr'],  // only these roles can change the field on PUT
+  },
+}
+```
+
+## Special fields
+
+<Accordion title="userId — the tenant column">
+  Every schema must declare `{ name: 'userId', type: String, required: true }`. The framework stamps its value from the JWT on every create; clients can never supply it. Omitting it from a tenant-scoped schema causes the loader to reject the file at boot with a `ValidationError`. A schema that genuinely has no tenant column (e.g. a system-internal ledger) should use `tenantScoped: false` at the schema level instead.
+</Accordion>
+
+<Accordion title="accountId — the org column">
+  The org/account column for multi-org models. Stamped server-side identically to `userId`. Do **not** use `accountId` as a custom foreign key — your client-supplied value would be clobbered by the stamping pass. Name custom FKs `parentAccountId`, `orgId`, etc.
+</Accordion>
+
+## Full example
+
+```js
+// String with full-text search
+{ name: 'name',         type: String,   required: true, searchable: true },
+
+// Money in cents (always store integers)
+{ name: 'amountCents',  type: Number,   required: true, min: 0 },
+
+// Enum with default
+{ name: 'priority',     type: String,   enum: ['low', 'med', 'high'], default: 'med' },
+
+// Computed field
+{ name: 'fullName',     type: String,
+  computed: (r) => `${r.firstName} ${r.lastName}` },
+
+// State machine
+{ name: 'status',       type: String,
+  stateMachine: {
+    initial: 'open',
+    states: ['open', 'closed'],
+    transitions: { open: ['closed'], closed: ['open'] },
+  },
+},
+
+// File upload (PDF only, 10 MB max)
+{ name: 'attachment',   type: 'File',
+  file: { maxBytes: 10 * 1024 * 1024, accept: ['application/pdf'] } },
+
+// Hidden from non-admins
+{ name: 'salary',       type: Number,   acl: { read: ['admin'] } },
+
+// Required reference (legacy shorthand)
+{ name: 'accountId',    type: String,   reference: 'account' },
+```

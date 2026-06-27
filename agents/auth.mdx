@@ -1,0 +1,159 @@
+---
+title: "Agent Auth Modes: Service-Account vs Per-User"
+sidebarTitle: "Auth Modes"
+description: "Choose between a single shared JWT for the whole bot or per-user refresh tokens via a secure link flow. Learn the tradeoffs and how to deploy each."
+---
+
+The JWT (or `X-Client-Id` header) **is** the access boundary on every read and write. The agent picks one of two strategies for deciding *whose* token to send. Choose once per deployment — `AGENT_AUTH_MODE` switches between them (default `service`).
+
+| Mode | One identity for the whole bot? | Each user maps to a real dAvePi user? |
+|---|---|---|
+| `service` | Yes — `DAVEPI_BEARER` or `DAVEPI_CLIENT_ID` | No |
+| `per-user` | No | Yes — via a one-time link flow |
+
+## Service mode
+
+One identity. Every chat turn, every tool call, every MCP request uses the same token. No per-user state, no refresh-token store, no link UI — the simplest possible deployment.
+
+### Bearer (JWT)
+
+```bash
+AGENT_AUTH_MODE=service        # the default — you can omit this line
+DAVEPI_BEARER=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+The bearer is treated as **static** — the agent does not rotate it via refresh tokens in this mode. Because dAvePi's `/login` issues access tokens with `ACCESS_TOKEN_TTL` (default `15m`), your options for production are:
+
+1. **Switch to per-user mode** (below) — the agent rotates refresh tokens automatically. This is the recommended production path.
+2. **Use a client id** (below) for anonymous read-only access.
+
+<Warning>
+  For a development loop, raise `ACCESS_TOKEN_TTL=2h` in your dAvePi server's `.env` so your token does not expire mid-session. The `2h` ceiling is a policy limit — do not exceed it.
+</Warning>
+
+### Client id (anonymous reads)
+
+```bash
+AGENT_AUTH_MODE=service
+DAVEPI_CLIENT_ID=pk_storefront_live_abc123
+```
+
+The client id is a **public identifier** — you can bake it into a browser bundle. The `apiClient` row on the dAvePi side declares the role, and any `schema.acl.scope[role]` filters restrict visibility server-side. The agent has no JWT and cannot write.
+
+When both `DAVEPI_BEARER` and `DAVEPI_CLIENT_ID` are configured, the bearer wins.
+
+### The `agent` service role
+
+When the [learning layer](/agents/personas-memory-skills) is on (`AGENT_KEY` is set), your agent's user should hold role `['agent']` — not `user` or `admin`. Field-level ACL on `agentPersona` and `skill.status` is keyed off the `agent` role; without it, the agent could rewrite its own brand voice or self-approve skills.
+
+| Caller | Roles | What it can do |
+|---|---|---|
+| Agent process (service token) | `['agent']` | Read all tenant data, write memory and customer profiles, draft skills, propose persona patches. Cannot promote skills or rewrite persona. |
+| Human operator (login JWT) | `['user']` / `['admin']` | Author persona, approve skills, read everything. |
+
+### When to use service mode
+
+- Anonymous storefront or marketing-site widget.
+- An internal "shared inbox" bot where every operator sees the same data.
+- Single-tenant deployments where the whole bot acts as the tenant's shared service account.
+
+## Per-user mode
+
+Each channel user maps to a real dAvePi user via a refresh token stored locally by the agent. Access tokens are minted on demand and cached just under the access-token TTL (`AGENT_ACCESS_TTL_SECONDS`, default `900` / 15 min, refreshed `AGENT_REFRESH_SKEW_SECONDS` early to absorb clock skew).
+
+```bash
+AGENT_AUTH_MODE=per-user
+AGENT_LINK_BASE_URL=https://agent.example.com      # public URL of the agent itself
+AGENT_SESSION_SECRET=$(openssl rand -hex 32)        # HMAC key for the session cookie
+STORE_URL=file:./davepi-agent-store.json            # refresh-token persistence
+```
+
+### The link flow
+
+dAvePi does not ship a browser-redirect OAuth `/login` — only JSON `POST /login` and `POST /auth/refresh`. The agent hosts the link UI itself, calling dAvePi server-to-server, so the refresh token never crosses the browser:
+
+```
+┌─────────┐  1. /chat (unlinked)          ┌──────────┐
+│  user   │ ────────────────────────────▶ │  agent   │
+│         │                               │          │
+│         │  2. UnlinkedError: /link/<n>  │          │
+│         │ ◀──────────────────────────── │          │
+│         │                               │          │
+│         │  3. GET /link/<nonce>         │          │
+│         │ ────────────────────────────▶ │ serves   │
+│         │        (HTML form)            │ HTML     │
+│         │ ◀──────────────────────────── │          │
+│         │                               │          │
+│         │  4. POST email + password     │          │     5. POST /login   ┌──────────┐
+│         │ ────────────────────────────▶ │  agent   │ ─────────────────▶  │ davepi   │
+│         │                               │          │ ◀── refreshToken    │          │
+│         │  6. session cookie + 'linked' │          │     (server-side)   └──────────┘
+│         │ ◀──────────────────────────── │          │
+│         │                               │          │
+│         │  7. /chat (now linked)        │          │
+│         │ ────────────────────────────▶ │          │
+└─────────┘                               └──────────┘
+```
+
+The refresh token is stored in the agent's `STORE_URL`, keyed by `(channel, channelUserId)`. On every chat turn the agent looks up the row, mints a fresh access token if needed, and uses it as the bearer for MCP calls.
+
+### The session cookie (HTTP channel)
+
+When a user completes the link form, the agent sets an HMAC-signed `davepi_agent_session` cookie:
+
+- **`HttpOnly`** — not accessible from JavaScript.
+- **`SameSite=Lax`** — survives top-level navigation, blocked cross-site.
+- **`Secure`** when `AGENT_COOKIE_SECURE=true` (the default).
+- **HMAC-signed** with `AGENT_SESSION_SECRET`. The body carries `{ cuid, iat, exp }`.
+- **30-day lifetime.**
+
+`POST /chat` reads the cookie on every request and **ignores any body-supplied `channelUserId`**. The cookie is the trust boundary — an earlier draft trusted body-supplied IDs, which allowed any caller to act as any linked user.
+
+Other channels (Slack, Telegram, WhatsApp) use their platform's signed event payload as the trust anchor and do not need a browser cookie.
+
+### Why refresh tokens are never in URLs
+
+The original design accepted refresh tokens at `POST /oauth/callback?refreshToken=...`. That endpoint now exists only to refuse loudly, because URL-borne tokens leak via server access logs, browser history, `Referer` headers, and tab-share scenarios. The form-based flow keeps the refresh token strictly server-side. Legacy clients that hit `/oauth/callback` receive a `403` with a clear message directing them to `/link/:nonce`.
+
+### Refresh token storage
+
+| `STORE_URL` | Behaviour |
+|---|---|
+| `file:./davepi-agent-store.json` | JSON file on disk. Survives restarts. Default. |
+| `memory:` | In-process only. Loses every refresh token on restart. Right for tests and stateless dev. |
+
+<Note>
+  For multi-instance per-user deployments you need a shared store. The file store is single-process; running two replicas with the same store path is unsupported today. A Redis-backed store is on the roadmap.
+</Note>
+
+### When to use per-user mode
+
+- A customer-portal bot where each customer must see only their own orders, invoices, or tickets.
+- An internal bot where the audit trail must record *which person* triggered each write.
+- Any deployment where dAvePi's owner-scoping is already the authorization model you want.
+
+## Choosing between them
+
+| If you can say… | Use… |
+|---|---|
+| *"Every visitor sees the same role-scoped slice of public data."* | `service` |
+| *"There's a shared inbox; everyone on the team should see the same conversations."* | `service` |
+| *"Customer A must not see Customer B's data, ever."* | `per-user` |
+| *"The audit log must record which human triggered each write."* | `per-user` |
+| *"I want owner-scoping for free without writing a tenant filter."* | `per-user` |
+
+A common pattern is **service mode for the storefront widget** (anonymous read of published products) and **per-user mode for the support bot** (each customer sees their own tickets). Run them as two separate processes against the same dAvePi backend.
+
+## Auth-related errors
+
+<Accordion title="Troubleshoot auth errors">
+
+| Symptom | Likely cause |
+|---|---|
+| `401 UNAUTHENTICATED` on first chat in service mode | `DAVEPI_BEARER` expired. Mint a fresh token, raise `ACCESS_TOKEN_TTL` on the dAvePi server (up to the 2h ceiling), or switch to per-user mode for automatic rotation. |
+| `401 UNLINKED` with a link URL in per-user mode | Expected — open the URL and sign in. The nonce is one-shot. |
+| `403 FORBIDDEN` writing memory or customer profile | The token's user lacks role `agent`. Check the user the agent's bearer was issued for. |
+| `404` opening a link URL | Nonce expired (default 15 min) or already consumed. Trigger a new chat turn to issue a fresh one. |
+| `403` posting to `/oauth/callback` | Expected — this endpoint refuses loudly. Use the `/link/:nonce` flow instead. |
+
+</Accordion>

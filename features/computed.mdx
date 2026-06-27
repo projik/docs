@@ -1,0 +1,148 @@
+---
+title: "Derive Read-Only Values with dAvePi Computed Fields"
+sidebarTitle: "Computed Fields"
+description: "Add a compute function to any field to derive values at read time — never stored in MongoDB, always present on every API surface and typed client."
+---
+
+Computed fields let you attach derived, read-only values to your records without storing them in MongoDB. You provide a function on the field definition, and dAvePi calls it on every read — for REST responses, GraphQL resolvers, MCP tool results, and the typed client. Consumers see the computed value exactly as if it were a stored field, including full TypeScript types and Swagger definitions.
+
+## Declare a Computed Field
+
+Add a `computed` function to any field in your schema definition:
+
+```js
+fields: [
+  { name: 'firstName', type: String, required: true },
+  { name: 'lastName',  type: String, required: true },
+
+  // Derived at read time — never stored
+  {
+    name: 'fullName',
+    type: String,
+    computed: (record) => `${record.firstName} ${record.lastName}`,
+  },
+
+  { name: 'price',    type: Number },
+  { name: 'quantity', type: Number },
+
+  {
+    name: 'total',
+    type: Number,
+    computed: (record) => (record.price ?? 0) * (record.quantity ?? 0),
+  },
+
+  { name: 'dueDate', type: Date },
+
+  {
+    name: 'isOverdue',
+    type: Boolean,
+    computed: (record) => Boolean(record.dueDate && record.dueDate < new Date()),
+  },
+]
+```
+
+The `computed` function receives two arguments:
+
+<ParamField path="record" type="object">
+  The full document as fetched from MongoDB, including all stored fields. You can reference any stored field on the record.
+</ParamField>
+
+<ParamField path="ctx" type="object">
+  Context provided by the framework. Contains `ctx.user` (the authenticated user), `ctx.now()` (an overridable date source), `ctx.count(path, filter)` (tenant-scoped count against another schema), `ctx.find(path, filter, opts)` (tenant-scoped find), and `ctx.req` (the underlying HTTP request when available).
+</ParamField>
+
+## Where Computed Fields Appear
+
+| Surface | Behaviour |
+|---------|-----------|
+| REST GET (single + list) | Field appears on every response object. |
+| GraphQL output type | Field is present; marked nullable if the function can return `undefined`. |
+| MCP `get_<path>` / `list_<path>` | Field appears on every record result. |
+| TypeScript client `<Resource>` interface | Marked `readonly`. |
+| Swagger | Field appears in the response schema with `readOnly: true`. |
+| `_describe` endpoint | Listed under `fields` with `computed: true`. |
+
+## Computed Fields Are Never Writable
+
+dAvePi structurally removes computed fields from all write paths — this is enforced by the loader, not by policy:
+
+- `POST` and `PUT` bodies have computed field values stripped before processing.
+- GraphQL input types (`<Path>Input`) omit computed fields entirely.
+- The `update_<path>` MCP tool input schema omits computed fields.
+- The typed client's `<Resource>Writable` interface omits computed fields.
+
+You cannot accidentally persist a computed value, even if a client sends one.
+
+## Async Computed Fields
+
+Your `computed` function can be `async`. Use this to derive values from related collections:
+
+```js
+{
+  name: 'unreadMessageCount',
+  type: Number,
+  computed: async (record, ctx) => {
+    return ctx.count('message', {
+      threadId: record._id,
+      read: false,
+    });
+  },
+}
+```
+
+dAvePi resolves async computed fields in parallel: on a list response with N records and K computed fields, it fans out `N × K` promises simultaneously.
+
+<Warning>
+Each async computed field triggers a database call per record. On a list of 100 records with 3 async computed fields, that is up to 300 parallel queries. Cache inside the function using `ctx.req`-scoped state, or consider mirroring the value as a stored field updated on writes.
+</Warning>
+
+## Filtering and Sorting Limitations
+
+Because computed fields are derived at response time, they do not exist in MongoDB. You cannot filter or sort by them using standard query parameters:
+
+```http
+# This will NOT work:
+GET /api/v1/invoice?isOverdue=true
+GET /api/v1/contact?__sort=fullName:asc
+```
+
+If you need to filter or sort on a derived value, choose one of these approaches:
+
+<CardGroup cols={2}>
+  <Card title="Mirror as a stored field" icon="database">
+    Update a stored copy of the derived value via a hook or a state-machine `onEnter` callback. The stored field is fully filterable and sortable.
+  </Card>
+  <Card title="Use an aggregation" icon="layer-group">
+    Build an aggregation pipeline that includes a `$set` or `$addFields` stage for the derived value, then `$match` or `$sort` on it before returning results.
+  </Card>
+</CardGroup>
+
+## Performance Guidelines
+
+Computed functions run on **every** read. Keep them fast.
+
+<Accordion title="Pure CPU computation (recommended)">
+  String concatenation, arithmetic, boolean logic, and date comparisons are free. Use these for the majority of computed fields.
+
+  ```js
+  computed: (record) => `${record.firstName} ${record.lastName}`
+  computed: (record) => record.price * record.quantity
+  computed: (record) => record.status === 'active' && !record.deletedAt
+  ```
+</Accordion>
+
+<Accordion title="Single database call per record (use sparingly)">
+  One `ctx.count()` or `ctx.find()` per record is workable on small lists, but adds up quickly. Consider caching or denormalising if you use this pattern on list endpoints.
+
+  ```js
+  computed: async (record, ctx) => ctx.count('comment', { postId: record._id })
+  ```
+</Accordion>
+
+<Accordion title="Anything heavier (avoid)">
+  Multiple database calls, HTTP requests, or expensive CPU work inside a computed function on a list endpoint recreates the N+1 problem. Move these to an aggregation or denormalise the value as a stored field updated by a hook.
+</Accordion>
+
+## Error Handling
+
+If a computed function throws, dAvePi surfaces `null` for that field on the response and logs a warning via `ctx.req.log`. A single failing computed field does not break the rest of the response or other fields on the same record.

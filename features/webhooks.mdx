@@ -1,0 +1,248 @@
+---
+title: "Outbound Webhooks for Record Lifecycle Events"
+sidebarTitle: "Webhooks"
+description: "Subscribe any HTTPS endpoint to record create, update, delete, and transition events — HMAC-signed, automatically retried, and tenant-scoped."
+---
+
+Outbound webhooks let downstream systems react to record lifecycle events without polling. Subscriptions are runtime data — you register them via `POST /api/v1/webhooks` just like any other resource, and the framework dispatches a signed `POST` to your endpoint whenever a matching event fires. Subscriptions are tenant-scoped: a subscription you create only receives events that happen within your tenant.
+
+## Creating a subscription
+
+```bash
+curl -X POST https://api.example.com/api/v1/webhooks \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "events": ["order.created", "order.transitioned", "account.*"],
+    "url":    "https://hooks.example.com/davepi"
+  }'
+```
+
+The response includes the `secret` exactly once:
+
+```json
+{
+  "_id":          "<sub-id>",
+  "userId":       "<tenant>",
+  "events":       ["order.created", "order.transitioned", "account.*"],
+  "url":          "https://hooks.example.com/davepi",
+  "active":       true,
+  "failureCount": 0,
+  "secret":       "<32-byte hex>",
+  "createdAt":    "...",
+  "updatedAt":    "..."
+}
+```
+
+<Warning>
+  Store the `secret` immediately — subsequent reads of the subscription omit it. If you lose it, delete the subscription and create a new one.
+</Warning>
+
+## Event patterns
+
+| Pattern | Matches |
+|---------|---------|
+| `order.created` | Exact event type only. |
+| `order.*` | Every `order.<verb>` event (`created`, `updated`, `deleted`, `transitioned`). |
+| `*` | Every event your tenant emits. Useful for catch-all integrations. |
+
+## Emitted event types
+
+The framework emits these for every schema:
+
+| Event type | When |
+|-----------|------|
+| `<path>.created` | `POST /api/v1/<path>` succeeds or a GraphQL create mutation does. |
+| `<path>.updated` | `PUT /api/v1/<path>/:id`, bulk-update `PUT`, or a GraphQL update mutation. |
+| `<path>.deleted` | `DELETE /api/v1/<path>/:id`, bulk delete, or a GraphQL delete mutation. |
+| `<path>.transitioned` | A state-machine field changes via REST `PUT`, `<path>Transition<Field>` GraphQL mutation, or MCP equivalent. |
+
+`<path>` is the schema's `path` declaration. Soft-delete restores emit `.updated` — there is no `.restored` event today.
+
+## Delivery shape
+
+Each delivery is an HTTP `POST` with these headers:
+
+```http
+X-davepi-Signature: sha256=<hex>
+X-davepi-Event:     order.created
+X-davepi-Delivery:  <uuid>
+Content-Type:       application/json
+```
+
+And a JSON body for single-record mutations:
+
+```json
+{
+  "id":          "<uuid>",
+  "type":        "order.created",
+  "version":     "v1",
+  "userId":      "<tenant>",
+  "recordId":    "<doc-id>",
+  "record":      { /* the affected document, ACL-projected */ },
+  "deliveredAt": "2026-05-11T12:00:00Z"
+}
+```
+
+For bulk mutations, `recordId` and `record` are replaced with:
+
+```json
+{
+  "filter":      { /* the query that matched */ },
+  "numAffected": 47
+}
+```
+
+<Note>
+  No "before" document is delivered. If your receiver needs the prior state, fetch it from `GET /api/v1/<path>/:id/history`.
+</Note>
+
+## Verifying the signature
+
+Always verify the `X-davepi-Signature` header before processing a delivery. Use a timing-safe comparison:
+
+```js
+const crypto = require('node:crypto');
+
+function verify(req, secret) {
+  const sig = req.headers['x-davepi-signature'] || '';
+  if (!sig.startsWith('sha256=')) return false;
+  const provided = sig.slice('sha256='.length);
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(req.rawBody)          // the raw bytes, NOT the parsed JSON
+    .digest('hex');
+  const a = Buffer.from(provided, 'hex');
+  const b = Buffer.from(expected, 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+```
+
+<Warning>
+  Sign against `req.rawBody` — the raw request bytes before JSON parsing. Use a middleware that preserves the raw body:
+
+  ```js
+  app.use(express.json({
+    verify: (req, _res, buf) => { req.rawBody = buf; },
+  }));
+  ```
+</Warning>
+
+## Retry and failure handling
+
+The dispatcher uses exponential backoff and auto-disables subscriptions that repeatedly fail:
+
+| Outcome | What happens |
+|---------|-------------|
+| HTTP 2xx | Success — `failureCount` resets to 0, `lastDeliveryAt` updated. |
+| Non-2xx, timeout (10 s), or network error | Retry on backoff schedule: 1 s → 5 s → 30 s → 5 min → 1 h. |
+| 10 consecutive failures | Subscription auto-disabled (`active: false`). Re-enable after fixing your receiver. |
+
+<Note>
+  Deliveries are **at-least-once** — a successful delivery may be retried if an earlier attempt timed out before your 2xx was received. Make your receiver idempotent and use the `X-davepi-Delivery` header (`id` in the body) as a deduplication key.
+</Note>
+
+## Testing a subscription
+
+Fire a synthetic `webhook.test` event to your endpoint without waiting for a real mutation:
+
+```bash
+curl -X POST https://api.example.com/api/v1/webhooks/<sub-id>/test \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+This is the fastest way to verify your receiver's signature check is working correctly.
+
+## Subscription management
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/v1/webhooks` | Create a subscription. Returns the `secret` once. |
+| `GET` | `/api/v1/webhooks` | List your subscriptions (secrets omitted). |
+| `GET` | `/api/v1/webhooks/:id` | Read one subscription (secret omitted). |
+| `DELETE` | `/api/v1/webhooks/:id` | Delete a subscription. |
+| `POST` | `/api/v1/webhooks/:id/test` | Hand-fire a `webhook.test` event. |
+
+All routes are tenant-scoped — subscriptions belong to the creating user's `userId`.
+
+## SSRF protection
+
+On create, the framework validates the URL against private, loopback, and link-local IP ranges. It also checks DNS resolutions. In `NODE_ENV=test` this check is relaxed so a local receiver on `127.0.0.1` can work in your test suite; production rejects loopback URLs.
+
+## Complete receiver example
+
+<CodeGroup>
+```js Express receiver
+const express = require('express');
+const crypto  = require('node:crypto');
+const app     = express();
+
+const WEBHOOK_SECRET = process.env.DAVEPI_WEBHOOK_SECRET;
+
+// Preserve raw body for signature verification
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
+
+function verify(req) {
+  const sig = req.headers['x-davepi-signature'] || '';
+  if (!sig.startsWith('sha256=')) return false;
+  const provided = sig.slice('sha256='.length);
+  const expected = crypto
+    .createHmac('sha256', WEBHOOK_SECRET)
+    .update(req.rawBody)
+    .digest('hex');
+  const a = Buffer.from(provided, 'hex');
+  const b = Buffer.from(expected, 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+app.post('/davepi', (req, res) => {
+  if (!verify(req)) return res.status(401).json({ error: 'invalid signature' });
+
+  const { type, recordId, record } = req.body;
+  console.log(`received ${type} for ${recordId}`);
+
+  // Use X-davepi-Delivery as a deduplication key
+  const deliveryId = req.headers['x-davepi-delivery'];
+  // ... idempotency check against deliveryId ...
+
+  res.json({ ok: true });
+});
+```
+
+```ts Fastify receiver (TypeScript)
+import Fastify from 'fastify';
+import fastifyRawBody from 'fastify-raw-body';
+import crypto from 'node:crypto';
+
+const app = Fastify();
+await app.register(fastifyRawBody);
+
+const WEBHOOK_SECRET = process.env.DAVEPI_WEBHOOK_SECRET!;
+
+function verify(rawBody: Buffer, sigHeader: string): boolean {
+  if (!sigHeader.startsWith('sha256=')) return false;
+  const provided = sigHeader.slice('sha256='.length);
+  const expected = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('hex');
+  const a = Buffer.from(provided, 'hex');
+  const b = Buffer.from(expected, 'hex');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+app.post('/davepi', async (req, reply) => {
+  const sig = (req.headers['x-davepi-signature'] as string) || '';
+  if (!verify(req.rawBody!, sig)) return reply.code(401).send({ error: 'invalid signature' });
+
+  const { type, recordId } = req.body as any;
+  console.log(`received ${type} for ${recordId}`);
+  return { ok: true };
+});
+```
+</CodeGroup>
+
+## See also
+
+- [State machines](/features/state-machines) — `<path>.transitioned` events.
+- [ACL](/features/acl) — ACL projection is applied to the `record` field on every delivery.
+- [Audit log](/features/audit) — the per-record history that receivers can look up via `/history`.
