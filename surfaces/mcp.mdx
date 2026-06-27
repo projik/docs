@@ -13,7 +13,7 @@ dAvePi exposes its full schema-driven surface as a [Model Context Protocol](http
 | **Streamable HTTP** | The agent or IDE talks to a running dAvePi server. Stateless — no sticky sessions needed. | `POST /mcp` |
 | **stdio** | Claude Desktop or Claude Code spawn the server as a child process. | `davepi mcp` |
 
-Both transports share the same tool implementations from `utils/mcpServer.js`. Tenant isolation, ACL projection, and soft-delete filtering all match the REST surface exactly.
+Both transports share the same tool implementations. Tenant isolation, ACL projection, and soft-delete filtering all match the REST surface exactly.
 
 ---
 

@@ -1,7 +1,7 @@
 ---
-title: "Role-Based Access Control in dAvePi Schemas"
+title: "Role-Based Access Control for dAvePi Schema Resources"
 sidebarTitle: "Access Control"
-description: "Control who can list, write, delete, and read individual fields by declaring ACL roles on your schema and field definitions."
+description: "Control who can list, write, delete, and read individual fields by declaring ACL roles on your schema and field definitions in dAvePi."
 ---
 
 Every schema starts owner-only: dAvePi scopes every read and write to the `userId` from the caller's JWT. ACL lets you open specific operations to additional roles — for example, letting an `admin` role list records across all tenants, or restricting a `salary` field to `hr` and `admin` only. You opt in one slot at a time; everything you don't declare stays owner-only.
@@ -94,14 +94,14 @@ module.exports = {
 
 ## ACL coverage across surfaces
 
-The same `projectByAcl` helper runs at every surface — there is no side channel that bypasses field-level ACL:
+ACL is enforced symmetrically at every surface — there is no side channel that bypasses field-level ACL:
 
 | Surface | Where ACL runs |
 |---------|---------------|
 | REST `GET` (list / get / by-id) | After the database find. |
-| REST `POST` / `PUT` | Before the write (input filter via `filterWritable`). |
-| GraphQL output | `<path>Type.applyAclProjection` resolver wrapper. |
-| GraphQL input | `filterWritable` strips non-writable fields. |
+| REST `POST` / `PUT` | Before the write (fields the caller cannot set are stripped from the input). |
+| GraphQL output | Projection applied in every output resolver. |
+| GraphQL input | Non-writable fields are stripped from input before persistence. |
 | MCP `list_*` / `get_*` | Same projector as REST. |
 | MCP `create_*` / `update_*` | Same input filter. |
 | Full-text search results | Before the response. |

@@ -1,7 +1,7 @@
 ---
-title: "Deploying a dAvePi App to Production"
+title: "Deploying dAvePi to Production: Env Vars and Platforms"
 sidebarTitle: "Deployment"
-description: "Environment variables, production posture, and step-by-step deploy guides for Fly.io, Render, Railway, and Docker."
+description: "Environment variables, production posture, and step-by-step deploy guides for Fly.io, Render, Railway, and Docker with real commands."
 ---
 
 dAvePi is a standard Node.js Express server. Anything that can run a Node app — Render, Fly.io, Railway, a Docker container on a VPS — can host it. There is no build step: `node index.js` boots the server. Before you deploy, you need two things: a MongoDB connection string and a `TOKEN_KEY` secret.

@@ -1,7 +1,7 @@
 ---
-title: "Agent Channels: HTTP, Slack, and Custom Adapters"
+title: "Agent Channels: HTTP, Slack, and Custom Channel Adapters"
 sidebarTitle: "Channels"
-description: "Wire your dAvePi agent to users via HTTP /chat SSE, Slack @-mention and DM, or build a custom channel adapter in ~150 lines."
+description: "Wire your dAvePi agent to users via HTTP /chat SSE streaming, Slack @-mention and DM, or build a custom channel adapter using the channelCtx contract."
 ---
 
 A **channel** is a thin adapter between an external messaging surface and the agent's `runTurn` orchestrator. Every channel does the same four things: receive an inbound message, build a `channelCtx` identifying the conversation, drive `runTurn` and stream events back, then translate structured `render` events into the platform's native UI.
@@ -237,7 +237,7 @@ Build the `channelCtx` object from the inbound event. For platforms with a threa
 ### Drive `runTurn`
 
 ```js
-const { runTurn } = require('@davepi/agent/lib/orchestrator');
+const { runTurn } = require('@davepi/agent');
 
 const out = await runTurn({
   config, model, mcpClient,

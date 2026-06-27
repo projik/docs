@@ -1,7 +1,7 @@
 ---
-title: "Logs, Metrics, and Error Tracking for dAvePi"
+title: "dAvePi Observability: Logs, Metrics, and Error Tracking"
 sidebarTitle: "Observability"
-description: "Structured JSON logs via pino, a built-in Prometheus metrics endpoint, Sentry error tracking, and OpenTelemetry tracing — copy-paste setup for each."
+description: "Structured JSON logs via pino, a built-in Prometheus metrics endpoint, Sentry error tracking, and OpenTelemetry tracing — setup guide for each."
 ---
 
 dAvePi runs on standard Node.js, Express, Mongoose, and Apollo. Every mainstream observability tool that auto-instruments those libraries works against dAvePi out of the box — typically with zero framework changes. The framework contributes structured JSON logs, a request-scoped `reqId` on every request, a built-in `/_metrics` endpoint for Prometheus, and a centralised error handler that ensures every unhandled rejection reaches the same termination point.

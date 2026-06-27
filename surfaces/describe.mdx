@@ -1,7 +1,7 @@
 ---
-title: "Capability Manifest Endpoint — GET /_describe"
+title: "dAvePi _describe — JSON Capability Manifest Endpoint"
 sidebarTitle: "Describe"
-description: "GET /_describe returns a compact JSON manifest of every resource's fields, relations, aggregations, state machines, and generated tool names in one request."
+description: "GET /_describe returns a compact JSON manifest of every resource's fields, relations, aggregations, state machines, and tool names in one round-trip."
 ---
 
 `GET /_describe` returns a compact JSON manifest of everything dAvePi knows about your loaded schemas — fields, relations, aggregations, file fields, ACL slots, soft-delete and audit flags, REST endpoints, GraphQL queries and mutations, and MCP tool names. An agent or tool landing on a fresh dAvePi project can plan against the entire API in one round-trip, before writing a single line of integration code.

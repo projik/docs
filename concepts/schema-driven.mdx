@@ -1,5 +1,5 @@
 ---
-title: "Schema-Driven Generation: One File, Every Surface"
+title: "Schema-Driven Generation: One Schema, Every Surface"
 sidebarTitle: "Schema-Driven"
 description: "Drop a schema file under schema/versions/v1/ and dAvePi generates REST routes, GraphQL types, MCP tools, Swagger docs, and an admin UI automatically."
 ---
@@ -72,17 +72,17 @@ There is no backend/frontend drift. There is no "I forgot to update the GraphQL 
   In development, set `HOT_RELOAD_SCHEMAS=true` before starting the server. Schema file changes are picked up in 50–150ms without a restart. See [Hot Reload](/concepts/hot-reload).
 </Tip>
 
-## How the generation works internally
+## How generation works at boot
 
-`utils/schemaLoader.js` walks `schema/versions/*` once at startup. For each schema it:
+The framework walks `schema/versions/*` once at startup. For each schema file it:
 
-1. Builds a Mongoose schema with timestamps, soft-delete, composite indexes, and the full-text index for searchable fields.
-2. Composes a Mongoose-derived type composer in graphql-compose's registry, wrapping every standard resolver with `wrapFilter` / `wrapByIdMutation` so tenant scoping is non-bypassable.
-3. Mounts a per-schema Express Router carrying every REST route.
-4. Emits a Swagger fragment into the live `apiSpec` object served at `/api-docs/swagger.json`.
-5. Registers MCP tools via `utils/mcpServer.js` against the same registry.
+1. Builds the database model with timestamps, soft-delete support, composite indexes, and a full-text index for every `searchable: true` field.
+2. Wires every standard resolver so tenant scoping is non-bypassable at the GraphQL layer.
+3. Mounts a dedicated router carrying every REST route for that resource.
+4. Emits a Swagger fragment into the live spec served at `/api-docs/swagger.json`.
+5. Registers per-resource MCP tools on the MCP server.
 
-Per-schema routers are mounted on the parent app via `app.use(router)`. During [hot reload](/concepts/hot-reload), a schema unload splices only that router out — the rest of the stack is untouched.
+During [hot reload](/concepts/hot-reload), only the affected resource's surface is rebuilt — the rest of the stack is untouched.
 
 ## What dAvePi does not do
 

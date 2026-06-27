@@ -1,5 +1,5 @@
 ---
-title: "Tenant Isolation: How dAvePi Keeps Data Separate"
+title: "Tenant Isolation: How dAvePi Keeps Your Data Separate"
 sidebarTitle: "Tenancy"
 description: "Every read scopes to the authenticated user's JWT, every write stamps ownership, and no surface can bypass it without an explicit ACL declaration."
 ---
@@ -30,15 +30,15 @@ Every Mongoose query: { ...filter, userId: req.user.user_id }
 
 dAvePi applies the scope at every surface independently, so there is no path that bypasses it by accident:
 
-| Surface | Enforcement point |
+| Surface | How it's enforced |
 |---------|-------------------|
-| REST `POST` | `utils/schemaLoader.js` stamps `userId` from `req.user.user_id` after `filterWritable` runs. |
-| REST `GET` (list / single) | `userId: req.user.user_id` is injected into the Mongo filter before the find. |
-| REST `PUT` (single / bulk) | Ownership query carries `userId`. Bulk `PUT` always forces `userId` into the upsert filter and is never bypassed. |
+| REST `POST` | `userId` is stamped from the authenticated JWT — any client-supplied value is ignored. |
+| REST `GET` (list / single) | `userId` is injected into the database filter before the query runs. |
+| REST `PUT` (single / bulk) | Ownership filter carries `userId`. Bulk `PUT` always forces `userId` into the upsert filter and is never bypassed. |
 | REST `DELETE` | Same ownership filter applied before delete. |
-| GraphQL | `wrapFilter` / `wrapByIdMutation` / `wrapFindById` in `utils/scopeResolver.js` inject `userId` into `rp.args.filter` before the resolver runs. |
-| MCP tools | Tool handlers go through the same Mongoose models with the same scoping. |
-| Aggregations | `runAggregation` prepends `$match: { userId }` as the first pipeline stage — even `unsafe: true` aggregations cannot return cross-tenant rows. |
+| GraphQL | `userId` is injected into every resolver's filter before it runs — including list, find-by-id, and mutation resolvers. |
+| MCP tools | Tool handlers share the same database models and the same scoping as REST and GraphQL. |
+| Aggregations | `userId` is prepended as the first match stage in every aggregation pipeline — even aggregations that perform raw pipeline operations cannot return cross-tenant rows. |
 | Relations (`__include`) | Each related query re-applies `userId` against the target collection. |
 
 ## ACL bypass slots for admin roles
@@ -131,6 +131,6 @@ dAvePi closes every one of these:
 - `POST`: `userId` is stamped server-side; any client-supplied value is ignored.
 - `GET / PUT / DELETE` by id: the filter includes `userId`, so a borrowed `_id` returns `404`.
 - `__include`: the related query re-applies `userId`.
-- GraphQL bulk: `wrapFilter` injects `userId` into the filter.
+- GraphQL bulk: `userId` is injected into every bulk mutation's filter before it runs.
 
-The cross-tenant isolation tests in `test/` cover every surface — REST, GraphQL, MCP, relations, and aggregations — as a structural regression guard.
+Cross-tenant isolation is verified across every surface — REST, GraphQL, MCP, relations, and aggregations — as a core correctness guarantee.

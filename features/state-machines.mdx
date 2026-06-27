@@ -1,7 +1,7 @@
 ---
-title: "Workflow State Machines on Schema Fields"
+title: "Finite-State Workflow Machines on dAvePi Schema Fields"
 sidebarTitle: "State Machines"
-description: "Declare a finite-state transition graph on any String field and let the framework enforce valid moves, stamp initial state, and expose available transitions."
+description: "Declare a finite-state transition graph on any String field and let dAvePi enforce valid moves, stamp initial state, and expose available transitions."
 ---
 
 A state-machine field is a `String` field with an extra `stateMachine` config block. The framework stamps the initial state at create time, validates every subsequent change against your declared transitions, rejects invalid moves with a structured error, runs `onEnter` side effects, and attaches `availableTransitions` to every read response so your UI can render the right action buttons without parsing the schema itself.
@@ -54,7 +54,7 @@ module.exports = {
     When you `POST` a new record, the framework sets the state-machine field to `initial` server-side. Any value the client sends for that field is ignored.
   </Step>
   <Step title="Validate every transition">
-    On every `PUT`, GraphQL update mutation, or MCP update, the framework checks whether the new value is listed in `transitions[currentState]`. If it isn't, the request is rejected with `422 INVALID_TRANSITION` before any write occurs.
+    On every `PUT`, GraphQL update mutation, or MCP update, the framework checks whether the new value is listed in `transitions[currentState]`. If it isn't, the request is rejected with `400 INVALID_TRANSITION` before any write occurs.
   </Step>
   <Step title="Run onEnter side effects">
     After a successful transition, the framework calls `onEnter[newState]` if you declared one. These are best-effort — errors are logged but never fail the response.

@@ -200,7 +200,8 @@ module.exports = {
           cancelUrl:  `${process.env.APP_URL}/orders/${record._id}/cancel`,
         });
         // Store the checkout session ID on the record for later lookup.
-        await req.app.locals.models.order.findByIdAndUpdate(
+        const Order = require('mongoose').model('order');
+        await Order.findByIdAndUpdate(
           record._id,
           { checkoutSessionId: session.id }
         );

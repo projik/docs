@@ -1,7 +1,7 @@
 ---
 title: "Declarative Aggregation Pipelines on dAvePi Schemas"
 sidebarTitle: "Aggregations"
-description: "Declare MongoDB aggregation pipelines on your schema and get REST, GraphQL, MCP, and typed-client surfaces automatically — with tenant isolation built in."
+description: "Declare aggregation pipelines on your schema and get REST, GraphQL, MCP, and typed-client surfaces automatically — with non-bypassable tenant isolation."
 ---
 
 Schemas can declare aggregation pipelines that the framework surfaces as a REST route, a GraphQL query, an MCP tool, and a typed client method — all from the same source-of-truth declaration. The aggregation runner prepends `$match: { userId }` automatically, so even the most freeform pipeline cannot return cross-tenant rows.

@@ -1,7 +1,7 @@
 ---
-title: "Lifecycle Hooks for Schema-Driven Resources"
+title: "Lifecycle Hooks for dAvePi Schema-Driven Resources"
 sidebarTitle: "Hooks"
-description: "Run code before or after every create, update, and delete on a single resource by declaring hooks directly on your schema file."
+description: "Run custom logic before or after every create, update, and delete on a single resource by declaring hooks directly on your dAvePi schema file."
 ---
 
 A lifecycle hook is a function you declare on a schema file that runs around the framework's persist step. Use hooks when a side effect or invariant belongs to one resource — validating a field combination before save, generating a derived value, sending a welcome email after create, or refusing a delete while dependents exist. For cross-resource side effects that span every schema, use a [plugin](/plugins/overview) instead.
@@ -255,6 +255,9 @@ Hooks fire on single-record paths only:
 | GraphQL `<path>CreateOne` | ✅ | Same shape as REST `POST`. |
 | GraphQL `<path>UpdateById` | ✅ | Same shape as REST `PUT` by id. |
 | GraphQL `<path>RemoveById` | ✅ | Same shape as REST `DELETE`. |
+| MCP `delete_<path>` | ✅ | Runs `beforeDelete` then `afterDelete`, same as REST `DELETE`. |
+| MCP `create_<path>` | ❌ | Hooks do not fire. State-machine initial state and ACL filtering still apply. |
+| MCP `update_<path>` | ❌ | Hooks do not fire. ACL filtering and state-machine transition validation still apply. |
 | Bulk `PUT /api/v1/<path>` | ❌ | Operates on a server-side filter; per-record hooks would multiply work unexpectedly. |
 | GraphQL `<path>CreateMany` | ❌ | Bulk path. |
 | GraphQL `<path>UpdateMany` / `<path>UpdateOne` | ❌ | Operate on a filter, not a known `_id`. |

@@ -1,5 +1,5 @@
 ---
-title: "Auto-Generated GraphQL API Reference for dAvePi"
+title: "dAvePi GraphQL API — Auto-Generated Queries and Mutations"
 sidebarTitle: "GraphQL"
 description: "Apollo Server ships out of the box at /graphql/ with full queries, mutations, relations, and state-machine transitions generated per schema."
 ---
@@ -161,25 +161,7 @@ List resolvers include a `deletedAt: null` predicate by default. Pass `_includeD
 
 ## Tenant scoping
 
-Every resolver is wrapped via helpers in `utils/scopeResolver.js`. The wrapper injects `userId: ctx.user.user_id` into the filter before the resolver runs — queries are always scoped to the authenticated user.
-
-<Warning>
-If you write a custom resolver, wrap it with the appropriate helper (`wrapFilter`, `wrapCreateOne`, `wrapByIdMutation`, etc.). Going directly to a Mongoose model bypasses tenant scoping entirely.
-</Warning>
-
-```js
-const { wrapFilter } = require('./utils/scopeResolver');
-
-tc.addResolver({
-  name: 'accountsWithDeals',
-  resolve: wrapFilter(
-    { schema, kind: 'read' },
-    async (rp, ctx) => {
-      // rp.args.filter already has userId injected; query freely.
-    }
-  ),
-});
-```
+Every resolver automatically injects `userId: ctx.user.user_id` into the filter before it runs — queries are always scoped to the authenticated user, and ownership fields are stamped server-side on writes. You cannot bypass this by passing `userId` in the request body or mutation input; the framework always overwrites it with the value from the verified JWT.
 
 ---
 

@@ -1,7 +1,7 @@
 ---
-title: "Error Codes and Response Shapes in dAvePi"
+title: "dAvePi Error Codes, Response Envelopes, and Fix Guidance"
 sidebarTitle: "Errors"
-description: "Every typed error code dAvePi returns, with HTTP status, error envelope shape, GraphQL and MCP variants, and fix guidance."
+description: "Every typed error code dAvePi returns — HTTP status, error envelope shape, per-code details, GraphQL and MCP variants, and how to fix each."
 ---
 
 dAvePi returns a consistent error envelope across every surface — REST, GraphQL, MCP, and the typed client. Read `code` in your code; read `message` as a human. The `code` field is part of the stability contract and will not change without a major version bump. `message` is human-readable prose and may vary across versions.
@@ -228,7 +228,7 @@ app.get('/api/v1/foo/:id/custom', auth(true), asyncHandler(async (req, res) => {
   <Card title="409 DUPLICATE" icon="copy">
     A unique index was violated. Check `details.field` and prompt the user to choose a different value.
   </Card>
-  <Card title="422 INVALID_TRANSITION" icon="arrows-rotate">
+  <Card title="400 INVALID_TRANSITION" icon="arrows-rotate">
     The state-machine transition is not permitted from the current state. Check `details.allowed` for valid next states.
   </Card>
   <Card title="429 RATE_LIMITED" icon="clock">

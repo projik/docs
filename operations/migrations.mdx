@@ -1,5 +1,5 @@
 ---
-title: "Schema Migrations: Backfilling Existing Records"
+title: "dAvePi Schema Migrations: Safe Field and Data Changes"
 sidebarTitle: "Migrations"
 description: "When you need a migration, when you don't, how to write and run one, and the expand-migrate-contract pattern for zero-downtime changes."
 ---
@@ -124,18 +124,17 @@ Use this three-step pattern for changes that touch existing rows AND existing re
 
 Each step is a separate deploy. Each step works with the row state left by the previous step, so partial rollouts and rollbacks are safe.
 
-## Running migrations in a deploy pipeline
+## Running migrations during a deploy
 
-The migration CLI exits non-zero on any failure, which halts a CI pipeline before the contract deploy runs.
+The migration CLI exits non-zero on any failure. Run it between the expand and contract deploys, from any shell with access to `MONGO_URI`:
 
-```yaml
-# Example GitHub Actions step (between expand and contract deploys)
-- name: Run migrations
-  run: npx davepi migrate up
-  env:
-    MONGO_URI: ${{ secrets.MONGO_URI }}
-    NODE_ENV: production
+```bash
+MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/davepi \
+NODE_ENV=production \
+npx davepi migrate up
 ```
+
+If the migration fails, the process exits with a non-zero code so you can halt the rest of the deploy. Fix the migration, re-snapshot if needed, and re-run.
 
 <Tip>
   Test migrations on a staging database that mirrors production data before running against production. A staging run surfaces data-shape surprises — missing fields, unexpected value distributions, index conflicts — without risk to live data.

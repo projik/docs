@@ -1,5 +1,5 @@
 ---
-title: "Plugin System Overview — dAvePi Extensions"
+title: "Plugin System Overview — Extend Your dAvePi App Now"
 sidebarTitle: "Overview"
 description: "Extend dAvePi with cross-cutting plugins: register routes, react to record events, integrate third-party services, and schedule background work."
 ---
@@ -239,7 +239,7 @@ A throw inside `setup` fails the entire process boot. This is intentional — si
 
 ### Runtime failures in plugin routes
 
-The framework calls `schemaLoader.moveErrorHandlerToEnd()` after every plugin finishes, so the terminal `errorHandler` is re-spliced to the tail of the stack. Errors thrown in plugin routes produce the standard response shape:
+The framework re-asserts the terminal `errorHandler` at the tail of the middleware stack after every plugin finishes. Errors thrown in plugin routes produce the standard response shape:
 
 ```json
 { "error": { "code": "...", "message": "..." } }

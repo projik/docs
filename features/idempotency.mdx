@@ -23,7 +23,7 @@ The first call executes the operation and returns `201 Created`. Any retry with 
 
 ```http
 HTTP/1.1 201 Created
-X-Idempotency-Replayed: true
+Idempotency-Replay: true
 Content-Type: application/json
 
 { "_id": "65b1...", "accountName": "Acme" }

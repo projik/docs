@@ -1,7 +1,7 @@
 ---
 title: "Background Jobs & Scheduled Tasks — Queue and Cron"
 sidebarTitle: "Jobs & Queues"
-description: "Offload slow work with durable BullMQ job queues and run recurring tasks with Mongo-backed distributed cron — both survive server restarts and multi-server deploys."
+description: "Offload slow work with durable BullMQ queues and run recurring tasks with Mongo-backed distributed cron — both survive restarts and multi-server deploys."
 ---
 
 Two plugins cover background work in dAvePi. `davepi-plugin-queue` gives you durable job queues for slow work that shouldn't block a request — email sends, PDF generation, third-party API calls. `davepi-plugin-cron` gives you declarative scheduled jobs that fire on a cron expression and are safe to run across multiple servers without double-executing. Both plugins are independent and can run together in the same app.
@@ -100,23 +100,32 @@ module.exports = {
 
 `POST /api/user` now returns immediately. The Postmark call runs in the background, retries up to five times with exponential backoff, and completes within seconds.
 
-### Enqueue without importing the plugin
+### Enqueue from inside a custom plugin's setup
 
-If you don't want to import `davepi-plugin-queue` inside a schema file, emit on the framework's bus instead:
+If you're authoring a plugin and have access to the `bus` passed to `setup()`, you can emit the `job:enqueue` event as a loose-coupling alternative to importing the queue plugin directly:
 
 ```js
-hooks: {
-  afterCreate: async ({ record, user, req }) => {
-    req.app.locals.bus.emit('job:enqueue', {
-      name: 'send-welcome',
-      data: { email: record.email, name: record.name },
-      opts: { user, attempts: 5 },
+// plugins/order-events.js
+module.exports = {
+  name: 'order-events',
+  async setup({ bus, log }) {
+    bus.on('record', async (event) => {
+      if (event.type !== 'order.created') return;
+      try {
+        bus.emit('job:enqueue', {
+          name: 'capture-payment',
+          data: { orderId: event.recordId, amount: event.record?.total },
+          opts: { user: { user_id: event.userId }, attempts: 5 },
+        });
+      } catch (err) {
+        log.error({ err }, 'enqueue failed');
+      }
     });
   },
-}
+};
 ```
 
-The plugin subscribes to the same bus and picks up the event. This keeps schema files decoupled from the queue plugin — the emit is a no-op when the queue is dormant.
+The queue plugin subscribes to `job:enqueue` on the same bus and persists the job. The emit is a no-op when the queue plugin is dormant. From schema lifecycle hooks, prefer `require('davepi-plugin-queue')` and call `queue.enqueue()` directly — it gives you the return value and clearer error messages.
 
 ### Rule-based auto-enqueue
 

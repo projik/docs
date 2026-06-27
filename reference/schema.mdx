@@ -1,7 +1,7 @@
 ---
-title: "Schema File Reference: All Top-Level Keys"
+title: "dAvePi Schema File Reference: All Top-Level Keys Explained"
 sidebarTitle: "Schema File"
-description: "Complete reference for a dAvePi schema file — every key the loader recognises, with examples and links to feature deep-dives."
+description: "Complete reference for a dAvePi schema file — every key the loader recognises, with type, default, and examples for each option."
 ---
 
 A schema file is a CommonJS module that exports a single plain object. Drop one under `schema/versions/v1/` and dAvePi builds REST routes, GraphQL types, MCP tools, and Swagger documentation from it automatically — no code generation step, no restart required in development. The loader walks every file once at boot (and on every change when `HOT_RELOAD_SCHEMAS=true`).

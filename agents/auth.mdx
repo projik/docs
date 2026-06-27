@@ -1,5 +1,5 @@
 ---
-title: "Agent Auth Modes: Service-Account vs Per-User"
+title: "Agent Auth: Service-Account and Per-User Modes Explained"
 sidebarTitle: "Auth Modes"
 description: "Choose between a single shared JWT for the whole bot or per-user refresh tokens via a secure link flow. Learn the tradeoffs and how to deploy each."
 ---
@@ -107,13 +107,13 @@ When a user completes the link form, the agent sets an HMAC-signed `davepi_agent
 - **HMAC-signed** with `AGENT_SESSION_SECRET`. The body carries `{ cuid, iat, exp }`.
 - **30-day lifetime.**
 
-`POST /chat` reads the cookie on every request and **ignores any body-supplied `channelUserId`**. The cookie is the trust boundary — an earlier draft trusted body-supplied IDs, which allowed any caller to act as any linked user.
+`POST /chat` reads the cookie on every request and **ignores any body-supplied `channelUserId`**. The cookie is the trust boundary — never trust a caller-supplied user id over the wire.
 
 Other channels (Slack, Telegram, WhatsApp) use their platform's signed event payload as the trust anchor and do not need a browser cookie.
 
 ### Why refresh tokens are never in URLs
 
-The original design accepted refresh tokens at `POST /oauth/callback?refreshToken=...`. That endpoint now exists only to refuse loudly, because URL-borne tokens leak via server access logs, browser history, `Referer` headers, and tab-share scenarios. The form-based flow keeps the refresh token strictly server-side. Legacy clients that hit `/oauth/callback` receive a `403` with a clear message directing them to `/link/:nonce`.
+Refresh tokens must never appear in URL query strings, because URL-borne tokens leak via server access logs, browser history, `Referer` headers, and tab-share scenarios. The form-based link flow keeps the refresh token strictly server-side — credentials POST to `<agent>/link/<nonce>` and the agent exchanges them with dAvePi server-to-server. The `POST /oauth/callback` endpoint refuses all requests with `403` and directs callers to the `/link/:nonce` flow instead.
 
 ### Refresh token storage
 
